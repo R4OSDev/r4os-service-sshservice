@@ -674,27 +674,9 @@ fn runService(app: *const App) i32 {
     }
 
     var next_accept_poll: u64 = 0;
-    while (!app.sys.programShouldClose()) {
+    var service_loop = r4os.ServiceLoop.init(app.sys, endpoint_handle, .{});
+    while (true) {
         const now = app.sys.ticks();
-        const poll = app.sys.serviceEndpointPoll(endpoint_handle);
-        if (poll < 0) {
-            closeListener(app, config.listen_port);
-            stopSessionWorkers(app, &stats, sessions[0..]);
-            freeAllSessionScratch(app, &stats, sessions[0..]);
-            _ = app.sys.serviceEndpointUnregister(endpoint_handle);
-            return poll;
-        }
-        if (poll > 0) {
-            const rc = handleRequest(app, endpoint_handle, &stats, &config, sessions[0..]);
-            if (rc < 0) {
-                closeListener(app, config.listen_port);
-                stopSessionWorkers(app, &stats, sessions[0..]);
-                freeAllSessionScratch(app, &stats, sessions[0..]);
-                _ = app.sys.serviceEndpointUnregister(endpoint_handle);
-                return rc;
-            }
-        }
-
         pollSessionWorkers(app, &stats, sessions[0..], false);
         prewarmSessionScratch(app, &stats, &config, sessions[0..]);
         if (now >= next_accept_poll) {
@@ -705,9 +687,30 @@ fn runService(app: *const App) i32 {
                 next_accept_poll = now + if (idle_ticks == 0) 1 else idle_ticks;
             }
         }
-        app.sys.sleepTicks(1);
+
+        switch (service_loop.wait(next_accept_poll)) {
+            .requests => |pending| {
+                const rc = service_loop.drain(pending, handleRequest, .{ app, endpoint_handle, &stats, &config, sessions[0..] });
+                if (rc >= 0) continue;
+                closeListener(app, config.listen_port);
+                stopSessionWorkers(app, &stats, sessions[0..]);
+                freeAllSessionScratch(app, &stats, sessions[0..]);
+                _ = app.sys.serviceEndpointUnregister(endpoint_handle);
+                return rc;
+            },
+            .deadline, .idle => {},
+            .stop => break,
+            .failure => |raw| {
+                closeListener(app, config.listen_port);
+                stopSessionWorkers(app, &stats, sessions[0..]);
+                freeAllSessionScratch(app, &stats, sessions[0..]);
+                _ = app.sys.serviceEndpointUnregister(endpoint_handle);
+                return raw;
+            },
+        }
     }
 
+    service_loop.report(service_name);
     closeListener(app, config.listen_port);
     stopSessionWorkers(app, &stats, sessions[0..]);
     freeAllSessionScratch(app, &stats, sessions[0..]);
