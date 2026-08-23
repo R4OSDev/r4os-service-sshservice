@@ -1,5 +1,6 @@
 const r4os = @import("r4os");
 const std = @import("std");
+const channel_flow = @import("channel_flow.zig");
 const ssh_chacha = @import("ssh_chacha.zig");
 const sftp_write_policy = @import("sftp_write_policy.zig");
 
@@ -85,6 +86,7 @@ const channel_eof_grace_ms: u64 = 1500;
 const exec_output_settle_ms: u64 = 8000;
 const channel_packet_timeout_ms: u64 = 5000;
 const channel_packet_total_timeout_ms: u64 = 30000;
+const channel_window_stall_timeout_ms: u64 = 30000;
 const transfer_idle_timeout_ms: u64 = 120 * 1000;
 const transfer_packet_total_timeout_ms: u64 = 120 * 1000;
 const tcp_service_wait_ms: u64 = 5000;
@@ -314,8 +316,18 @@ const ServiceStats = struct {
     last_sftp_write_result: [32]u8 = .{0} ** 32,
     last_sftp_write_path: [128]u8 = .{0} ** 128,
     channel_window_adjusts: u32 = 0,
+    channel_window_adjust_bytes: u64 = 0,
+    channel_window_blocks: u32 = 0,
+    channel_window_stall_timeouts: u32 = 0,
+    channel_output_queue_high_water: u32 = 0,
+    channel_client_window_initial: u32 = 0,
+    channel_client_packet_max: u32 = 0,
     channel_data_in: u32 = 0,
     channel_data_out: u32 = 0,
+    shell_input_batches: u32 = 0,
+    shell_input_accepted: u64 = 0,
+    shell_input_backpressure: u32 = 0,
+    shell_input_pending_high_water: u32 = 0,
     channel_client_closes: u32 = 0,
     channel_client_eofs: u32 = 0,
     channel_idle_timeouts: u32 = 0,
@@ -447,6 +459,8 @@ const SessionBuffers = struct {
     preloaded_plain: [ssh_preload_max]u8 = .{0} ** ssh_preload_max,
     preloaded_plain_pos: usize = 0,
     preloaded_plain_len: usize = 0,
+    channel_output: channel_flow.OutputQueue = .{},
+    console_input: channel_flow.InputQueue = .{},
     console_output: [r4os.abi.console_output_capacity + 1]u8 = .{0} ** (r4os.abi.console_output_capacity + 1),
     sftp_recipient_channel: u32 = 0,
     sftp_input: []u8 = &.{},
@@ -485,6 +499,7 @@ const ScpState = enum(u8) {
     none,
     source_wait_initial_ack,
     source_wait_header_ack,
+    source_streaming,
     source_wait_final_ack,
     sink_wait_command,
     sink_read_data,
@@ -503,6 +518,8 @@ const ChannelState = struct {
     close_sent: bool = false,
     client_channel: u32 = 0,
     server_channel: u32 = 0,
+    send_window: channel_flow.SendWindow = .{},
+    receive_window_remaining: u32 = ssh_channel_window,
     shell_instance: u32 = 0,
     shell_skip_next_lf: bool = false,
     cols: u32 = 80,
@@ -518,6 +535,8 @@ const ChannelState = struct {
     keepalive_outstanding: bool = false,
     last_keepalive_tick: u64 = 0,
     channel_window_consumed: usize = 0,
+    close_after_output: bool = false,
+    close_after_output_status: u32 = 0,
     sftp_input_len: usize = 0,
     sftp_handle_kind: SftpHandleKind = .none,
     sftp_upload_len: usize = 0,
@@ -892,6 +911,20 @@ fn replyStatusView(app: *const App, endpoint_handle: u32, request_id: u32, stats
     }
     appendText(out[0..], &pos, " winadj=");
     appendU64(out[0..], &pos, @intCast(stats.channel_window_adjusts));
+    appendText(out[0..], &pos, "/");
+    appendU64(out[0..], &pos, stats.channel_window_adjust_bytes);
+    appendText(out[0..], &pos, " client_win=");
+    appendU64(out[0..], &pos, stats.channel_client_window_initial);
+    appendText(out[0..], &pos, " client_pkt=");
+    appendU64(out[0..], &pos, stats.channel_client_packet_max);
+    appendText(out[0..], &pos, " win_block=");
+    appendU64(out[0..], &pos, @intCast(stats.channel_window_blocks));
+    appendText(out[0..], &pos, "/");
+    appendU64(out[0..], &pos, @intCast(stats.channel_window_stall_timeouts));
+    appendText(out[0..], &pos, " outq_high=");
+    appendU64(out[0..], &pos, stats.channel_output_queue_high_water);
+    appendText(out[0..], &pos, "/");
+    appendU64(out[0..], &pos, channel_flow.output_capacity);
     appendText(out[0..], &pos, " chan_win=");
     appendU64(out[0..], &pos, ssh_channel_window);
     appendText(out[0..], &pos, " chan_pkt=");
@@ -908,6 +941,16 @@ fn replyStatusView(app: *const App, endpoint_handle: u32, request_id: u32, stats
     appendU64(out[0..], &pos, @intCast(stats.channel_data_in));
     appendText(out[0..], &pos, " out=");
     appendU64(out[0..], &pos, @intCast(stats.channel_data_out));
+    appendText(out[0..], &pos, " shell_in=");
+    appendU64(out[0..], &pos, stats.shell_input_accepted);
+    appendText(out[0..], &pos, "/");
+    appendU64(out[0..], &pos, @intCast(stats.shell_input_batches));
+    appendText(out[0..], &pos, "/");
+    appendU64(out[0..], &pos, @intCast(stats.shell_input_backpressure));
+    appendText(out[0..], &pos, " shell_q_high=");
+    appendU64(out[0..], &pos, stats.shell_input_pending_high_water);
+    appendText(out[0..], &pos, "/");
+    appendU64(out[0..], &pos, channel_flow.input_capacity);
     appendText(out[0..], &pos, " eof=");
     appendU64(out[0..], &pos, @intCast(stats.channel_client_eofs));
     appendText(out[0..], &pos, " client_close=");
@@ -1286,6 +1329,8 @@ fn resetSessionBuffers(buffers: *SessionBuffers) void {
     @memset(buffers.preloaded_plain[0..], 0);
     buffers.preloaded_plain_pos = 0;
     buffers.preloaded_plain_len = 0;
+    buffers.channel_output.clear();
+    buffers.console_input.clear();
     @memset(buffers.console_output[0..], 0);
     buffers.sftp_recipient_channel = 0;
     @memset(buffers.sftp_input, 0);
@@ -1540,8 +1585,20 @@ fn mergeSessionStats(out: *ServiceStats, session: *const ServiceStats) void {
     }
     releaseTransferRecordLock(mutable_session);
     out.channel_window_adjusts +%= session.channel_window_adjusts;
+    out.channel_window_adjust_bytes +%= session.channel_window_adjust_bytes;
+    out.channel_window_blocks +%= session.channel_window_blocks;
+    out.channel_window_stall_timeouts +%= session.channel_window_stall_timeouts;
+    out.channel_output_queue_high_water = @max(out.channel_output_queue_high_water, session.channel_output_queue_high_water);
+    if (session.channel_opens != 0) {
+        out.channel_client_window_initial = session.channel_client_window_initial;
+        out.channel_client_packet_max = session.channel_client_packet_max;
+    }
     out.channel_data_in +%= session.channel_data_in;
     out.channel_data_out +%= session.channel_data_out;
+    out.shell_input_batches +%= session.shell_input_batches;
+    out.shell_input_accepted +%= session.shell_input_accepted;
+    out.shell_input_backpressure +%= session.shell_input_backpressure;
+    out.shell_input_pending_high_water = @max(out.shell_input_pending_high_water, session.shell_input_pending_high_water);
     out.channel_client_closes +%= session.channel_client_closes;
     out.channel_client_eofs +%= session.channel_client_eofs;
     out.channel_idle_timeouts +%= session.channel_idle_timeouts;
@@ -2251,13 +2308,88 @@ fn handleConnectionSession(
     while (!app.sys.programShouldClose()) {
         const now = app.sys.ticks();
         _ = pumpServiceEndpointDuringSession(app, endpoint_handle, stats, config);
-        if (!pumpConsoleOutput(app, conn_id, stats, s2c_key, buffers, rng, seq_out, &channel)) {
+        if (!channel.close_after_output and
+            !pumpShellInput(app, conn_id, stats, s2c_key, &channel, buffers, rng, seq_out))
+        {
+            stats.protocol_errors +%= 1;
+            setLastProtocolError(stats, "shell-input-pump");
+            return -1;
+        }
+        if (!channel.close_after_output and channel.scp_state == .source_streaming and
+            !pumpScpSourceOutput(app, conn_id, stats, s2c_key, buffers, rng, seq_out, &channel))
+        {
+            stats.protocol_errors +%= 1;
+            setLastProtocolError(stats, "scp-source-pump");
+            return -1;
+        }
+        if (!channel.close_after_output and channel.sftp_started and buffers.channel_output.empty() and channel.sftp_input_len != 0) {
+            switch (handleSftpChannelData(app, conn_id, stats, config, s2c_key, "", &channel, buffers, rng, seq_out)) {
+                .continue_session => {},
+                .close_session => return 0,
+                .protocol_error => return -1,
+            }
+        }
+        if (!channel.close_after_output and channel.scp_mode == .sink and buffers.channel_output.empty() and channel.scp_input_len != 0) {
+            switch (handleScpChannelData(app, conn_id, stats, config, s2c_key, "", &channel, buffers, rng, seq_out)) {
+                .continue_session => {},
+                .close_session => return 0,
+                .protocol_error => return -1,
+            }
+        }
+        if (!channel.close_after_output and
+            !pumpConsoleOutput(app, conn_id, stats, s2c_key, buffers, rng, seq_out, &channel))
+        {
             stats.channel_output_failures +%= 1;
             if (!pollEncryptedPacket(app, conn_id).alive) {
                 finishClientDisconnect(app, stats, &channel, "client-disconnect");
                 return 0;
             }
             setLastProtocolError(stats, "output-client-disconnect");
+        }
+        var output_failed = false;
+        var output_round: u8 = 0;
+        while (output_round < 8) : (output_round += 1) {
+            switch (pumpChannelOutput(app, conn_id, stats, s2c_key, buffers, rng, seq_out, &channel)) {
+                .progress => {
+                    if (buffers.channel_output.empty() and channel.scp_state == .source_streaming and
+                        !pumpScpSourceOutput(app, conn_id, stats, s2c_key, buffers, rng, seq_out, &channel))
+                    {
+                        output_failed = true;
+                        break;
+                    }
+                    continue;
+                },
+                .idle, .blocked => break,
+                .failed => {
+                    output_failed = true;
+                    break;
+                },
+            }
+        }
+        if (output_failed) {
+            stats.channel_output_failures +%= 1;
+            if (!pollEncryptedPacket(app, conn_id).alive) {
+                finishClientDisconnect(app, stats, &channel, "client-disconnect");
+                return 0;
+            }
+            setLastProtocolError(stats, "channel-output-send");
+        }
+        if (channel.send_window.stalled(app.sys.ticks(), app.sys.ticksFromMilliseconds(channel_window_stall_timeout_ms))) {
+            stats.channel_window_stall_timeouts +%= 1;
+            abortActiveTransfers(app, stats, &channel, "channel-window-timeout");
+            if (channel.shell_instance != 0 and !remoteProgramDone(app, channel.shell_instance)) _ = app.sys.programKill(channel.shell_instance);
+            noteChannelExit(stats, -9);
+            noteCloseReason(stats, "channel-window-timeout");
+            setLastProtocolError(stats, "channel-window-timeout");
+            buffers.channel_output.clear();
+            sendChannelExitAndClose(app, conn_id, s2c_key, buffers, rng, seq_out, &channel, 1);
+            reapProgramInstance(app, channel.shell_instance);
+            return 0;
+        }
+        if (channel.close_after_output and buffers.channel_output.empty()) {
+            sendChannelExitAndClose(app, conn_id, s2c_key, buffers, rng, seq_out, &channel, channel.close_after_output_status);
+            reapProgramInstance(app, channel.shell_instance);
+            return 0;
         }
 
         // 0.56.34b: ALLE Idle-/Settle-Checks mit saturierender Subtraktion.
@@ -2266,7 +2398,7 @@ fn handleConnectionSession(
         // Ticks -> last > now -> u64-Unterlauf -> Timeout feuert sofort.
         // Genau das toetete jede interaktive Shell in der Prompt-Iteration
         // (idle-dbg-Beleg: now=1189, last_activity=1191).
-        if (channelTransferActive(&channel) and now -| channel.last_activity_tick >= transfer_idle_timeout) {
+        if (!channel.close_after_output and channelTransferActive(&channel) and now -| channel.last_activity_tick >= transfer_idle_timeout) {
             abortActiveTransfers(app, stats, &channel, "transfer-idle-timeout");
             stats.channel_idle_timeouts +%= 1;
             noteCloseReason(stats, "transfer-idle-timeout");
@@ -2274,15 +2406,12 @@ fn handleConnectionSession(
             return 0;
         }
 
-        if (channel.shell_started) {
+        if (!channel.close_after_output and channel.shell_started) {
             if (remoteProgramExitCode(app, channel.shell_instance)) |exit_code| {
                 channel.last_exit_code = exit_code;
                 noteChannelExit(stats, exit_code);
                 noteCloseReason(stats, "remote-exit");
-                drainConsoleOutputForClose(app, conn_id, endpoint_handle, stats, config, s2c_key, buffers, rng, seq_out, &channel);
-                sendChannelExitAndClose(app, conn_id, s2c_key, buffers, rng, seq_out, &channel, sshExitStatus(exit_code));
-                reapProgramInstance(app, channel.shell_instance);
-                return 0;
+                scheduleChannelClose(&channel, sshExitStatus(exit_code));
             }
         }
 
@@ -2295,33 +2424,27 @@ fn handleConnectionSession(
         // stille Kommandos halten die Sitzung jetzt beliebig lange; die
         // Client-Liveness sichert weiterhin der 5s/5s-Keepalive.
         const exec_settle_ticks = app.sys.ticksFromMilliseconds(exec_output_settle_ms);
-        if (channel.exec_started and
+        if (!channel.close_after_output and channel.exec_started and
             channel.exec_output_observed and
             channel.last_console_change_tick != 0 and
             exec_settle_ticks != 0 and
             now -| channel.last_console_change_tick >= exec_settle_ticks and
             (channel.shell_instance == 0 or remoteProgramDone(app, channel.shell_instance)))
         {
-            drainConsoleOutputForClose(app, conn_id, endpoint_handle, stats, config, s2c_key, buffers, rng, seq_out, &channel);
             channel.last_exit_code = 0;
             noteChannelExit(stats, 0);
             noteCloseReason(stats, "exec-output-stable");
-            sendChannelExitAndClose(app, conn_id, s2c_key, buffers, rng, seq_out, &channel, 0);
-            reapProgramInstance(app, channel.shell_instance);
-            return 0;
+            scheduleChannelClose(&channel, 0);
         }
 
-        if (channel.client_eof and !channel.exec_started and channel.eof_tick != 0 and now -| channel.eof_tick >= eof_grace) {
-            drainConsoleOutputForClose(app, conn_id, endpoint_handle, stats, config, s2c_key, buffers, rng, seq_out, &channel);
+        if (!channel.close_after_output and channel.client_eof and !channel.exec_started and channel.eof_tick != 0 and now -| channel.eof_tick >= eof_grace) {
             if (channel.shell_instance != 0 and !remoteProgramDone(app, channel.shell_instance)) _ = app.sys.programKill(channel.shell_instance);
             noteChannelExit(stats, 0);
             noteCloseReason(stats, "client-eof");
-            sendChannelExitAndClose(app, conn_id, s2c_key, buffers, rng, seq_out, &channel, 0);
-            reapProgramInstance(app, channel.shell_instance);
-            return 0;
+            scheduleChannelClose(&channel, 0);
         }
 
-        if (now -| channel.last_activity_tick >= idle_timeout) {
+        if (!channel.close_after_output and now -| channel.last_activity_tick >= idle_timeout) {
             // 0.56.34b-Diagnose: now/last_activity am Idle-Close festhalten
             // (fail_pkt=last_activity, fail_pay=now via fail-Diagfelder).
             setPacketReadFail(stats, "idle-dbg", @intCast(now & 0xffff_ffff), @intCast(channel.last_activity_tick & 0xffff_ffff));
@@ -2333,10 +2456,8 @@ fn handleConnectionSession(
             stats.channel_idle_timeouts +%= 1;
             noteChannelExit(stats, exit_code);
             noteCloseReason(stats, "idle-timeout");
-            sendChannelExitAndClose(app, conn_id, s2c_key, buffers, rng, seq_out, &channel, sshExitStatus(exit_code));
-            reapProgramInstance(app, channel.shell_instance);
             setLastProtocolError(stats, "channel-idle-timeout");
-            return 0;
+            scheduleChannelClose(&channel, sshExitStatus(exit_code));
         }
 
         const packet_state = pollEncryptedPacket(app, conn_id);
@@ -2559,12 +2680,18 @@ fn handleChannelOpen(app: *const App, conn_id: u32, stats: *ServiceStats, key: [
     var r = Reader.init(payload[1..]);
     const channel_type = r.readString() orelse return false;
     const sender_channel = r.readU32() orelse return false;
-    _ = r.readU32() orelse return false;
-    _ = r.readU32() orelse return false;
+    const initial_window = r.readU32() orelse return false;
+    const packet_max = r.readU32() orelse return false;
     if (!bytesEq(channel_type, ssh_channel_session)) {
         _ = sendChannelOpenFailure(app, conn_id, key, sender_channel, "unsupported channel type", buffers, rng, seq_out);
         stats.protocol_errors +%= 1;
         setLastProtocolError(stats, "channel-type");
+        return false;
+    }
+    if (packet_max == 0) {
+        _ = sendChannelOpenFailure(app, conn_id, key, sender_channel, "invalid maximum packet size", buffers, rng, seq_out);
+        stats.protocol_errors +%= 1;
+        setLastProtocolError(stats, "channel-packet-zero");
         return false;
     }
 
@@ -2573,9 +2700,13 @@ fn handleChannelOpen(app: *const App, conn_id: u32, stats: *ServiceStats, key: [
         .open = true,
         .client_channel = sender_channel,
         .server_channel = 0,
+        .send_window = channel_flow.SendWindow.init(initial_window, packet_max),
+        .receive_window_remaining = ssh_channel_window,
         .last_activity_tick = app.sys.ticks(),
         .session_slot = session_slot,
     };
+    stats.channel_client_window_initial = initial_window;
+    stats.channel_client_packet_max = packet_max;
     stats.channel_opens +%= 1;
     app.sys.println("SSHD channel open: session");
     return sendChannelOpenConfirmation(app, conn_id, key, channel, buffers, rng, seq_out);
@@ -2595,8 +2726,14 @@ fn handleChannelWindowAdjust(stats: *ServiceStats, payload: []const u8, channel:
     var r = Reader.init(payload[1..]);
     const recipient = r.readU32() orelse return .protocol_error;
     if (recipient != channel.server_channel) return .protocol_error;
-    _ = r.readU32() orelse return .protocol_error;
+    const increment = r.readU32() orelse return .protocol_error;
+    if (!channel.send_window.adjust(increment)) {
+        stats.protocol_errors +%= 1;
+        setLastProtocolError(stats, "channel-window-overflow");
+        return .protocol_error;
+    }
     stats.channel_window_adjusts +%= 1;
+    stats.channel_window_adjust_bytes +%= increment;
     return .continue_session;
 }
 
@@ -2712,6 +2849,12 @@ fn handleChannelData(app: *const App, conn_id: u32, stats: *ServiceStats, config
     const recipient = r.readU32() orelse return .protocol_error;
     if (recipient != channel.server_channel) return .protocol_error;
     const data = r.readString() orelse return .protocol_error;
+    if (data.len > channel.receive_window_remaining) {
+        stats.protocol_errors +%= 1;
+        setLastProtocolError(stats, "channel-input-window");
+        return .protocol_error;
+    }
+    channel.receive_window_remaining -= @intCast(data.len);
     if (channel.sftp_started) {
         const action = handleSftpChannelData(app, conn_id, stats, config, key, data, channel, buffers, rng, seq_out);
         if (action == .continue_session and data.len != 0) {
@@ -2727,30 +2870,49 @@ fn handleChannelData(app: *const App, conn_id: u32, stats: *ServiceStats, config
         return action;
     }
     if (!channel.shell_started or channel.shell_instance == 0) return .continue_session;
-    pushShellInput(app, channel, data);
     stats.channel_data_in +%= @intCast(data.len);
-    if (data.len != 0 and !ackChannelInputWindow(app, conn_id, stats, key, channel, buffers, rng, seq_out, data.len)) return .protocol_error;
+    if (!pushShellInput(app, conn_id, stats, key, channel, buffers, rng, seq_out, data)) return .protocol_error;
     return .continue_session;
 }
 
-fn pushShellInput(app: *const App, channel: *ChannelState, data: []const u8) void {
-    for (data) |raw_ch| {
-        var ch = raw_ch;
-        if (channel.shell_skip_next_lf) {
-            channel.shell_skip_next_lf = false;
-            if (ch == '\n') continue;
-        }
-        if (ch == '\r') {
-            ch = '\n';
-            channel.shell_skip_next_lf = true;
-        }
-        // 0.56.34d: Termius/xterm senden Backspace als DEL (0x7F), die
-        // R4OS-Konsole versteht nur BS (0x08) - uebersetzen, sonst kann
-        // im SSH-Terminal nichts geloescht werden.
-        if (ch == 0x7f) ch = 0x08;
-        const pushed = app.sys.consolePushKey(channel.shell_instance, ch);
-        if (pushed < 0) break;
+fn pushShellInput(app: *const App, conn_id: u32, stats: *ServiceStats, key: []const u8, channel: *ChannelState, buffers: *SessionBuffers, rng: *SessionRng, seq_out: *u32, data: []const u8) bool {
+    if (data.len > buffers.console_input.available()) {
+        stats.shell_input_backpressure +%= 1;
+        setLastProtocolError(stats, "shell-input-overflow");
+        return false;
     }
+    var normalized: [ssh_channel_packet_max]u8 = undefined;
+    const result = channel_flow.normalizeConsoleInput(normalized[0..], data, &channel.shell_skip_next_lf) orelse return false;
+    if (!buffers.console_input.append(normalized[0..result.produced])) return false;
+    const pending = buffers.console_input.pending();
+    if (pending > stats.shell_input_pending_high_water) {
+        stats.shell_input_pending_high_water = @intCast(@min(pending, std.math.maxInt(u32)));
+    }
+    if (result.consumed_without_output != 0 and
+        !ackChannelInputWindow(app, conn_id, stats, key, channel, buffers, rng, seq_out, result.consumed_without_output))
+    {
+        return false;
+    }
+    return pumpShellInput(app, conn_id, stats, key, channel, buffers, rng, seq_out);
+}
+
+fn pumpShellInput(app: *const App, conn_id: u32, stats: *ServiceStats, key: []const u8, channel: *ChannelState, buffers: *SessionBuffers, rng: *SessionRng, seq_out: *u32) bool {
+    if (!channel.shell_started or channel.shell_instance == 0 or buffers.console_input.empty()) return true;
+    const pending = buffers.console_input.peek();
+    stats.shell_input_batches +%= 1;
+    const accepted_raw = app.sys.consolePushInput(channel.shell_instance, pending);
+    if (accepted_raw < 0) {
+        setLastProtocolError(stats, "shell-input-push");
+        return false;
+    }
+    if (accepted_raw == 0) {
+        stats.shell_input_backpressure +%= 1;
+        return true;
+    }
+    const accepted = @min(@as(usize, @intCast(accepted_raw)), pending.len);
+    if (!buffers.console_input.consume(accepted)) return false;
+    stats.shell_input_accepted +%= @intCast(accepted);
+    return ackChannelInputWindow(app, conn_id, stats, key, channel, buffers, rng, seq_out, accepted);
 }
 
 fn startRemoteShell(app: *const App, stats: *ServiceStats, config: *const Config, channel: *ChannelState) bool {
@@ -2856,8 +3018,7 @@ fn runDirectDiagnostic(
     channel.last_activity_tick = app.sys.ticks();
     noteSessionKind(stats, "diag-direct", command);
     stats.exec_sessions +%= 1;
-    var sent = sendChannelData(app, conn_id, key, buffers, rng, seq_out, channel.client_channel, output[0..pos]);
-    if (sent) stats.channel_data_out +%= @intCast(pos);
+    var sent = queueChannelData(stats, buffers, output[0..pos]);
     if (sent and inventory_ok and wants_tasks) {
         sent = sendDirectTaskInventory(
             app,
@@ -2876,8 +3037,8 @@ fn runDirectDiagnostic(
     channel.last_exit_code = exit_code;
     noteChannelExit(stats, exit_code);
     noteCloseReason(stats, "diag-direct");
-    sendChannelExitAndClose(app, conn_id, key, buffers, rng, seq_out, channel, sshExitStatus(exit_code));
-    return .close_session;
+    scheduleChannelClose(channel, sshExitStatus(exit_code));
+    return .continue_session;
 }
 
 fn collectDirectTaskInventory(
@@ -3024,9 +3185,13 @@ fn sendDirectDiagnosticLine(
     seq_out: *u32,
     line: []const u8,
 ) bool {
-    if (!sendChannelData(app, conn_id, key, buffers, rng, seq_out, channel.client_channel, line)) return false;
-    stats.channel_data_out +%= @intCast(line.len);
-    return true;
+    _ = app;
+    _ = conn_id;
+    _ = key;
+    _ = channel;
+    _ = rng;
+    _ = seq_out;
+    return queueChannelData(stats, buffers, line);
 }
 
 const RemoteProgramKind = enum {
@@ -3266,10 +3431,11 @@ fn startScpSink(app: *const App, stats: *ServiceStats, config: *const Config, ch
 
 fn handleScpChannelData(app: *const App, conn_id: u32, stats: *ServiceStats, config: *const Config, key: []const u8, data: []const u8, channel: *ChannelState, buffers: *SessionBuffers, rng: *SessionRng, seq_out: *u32) ChannelAction {
     _ = config;
-    if (data.len == 0) return .continue_session;
-    stats.channel_data_in +%= @intCast(data.len);
-    stats.scp_bytes_in +%= @intCast(data.len);
-    channel.last_activity_tick = app.sys.ticks();
+    if (data.len != 0) {
+        stats.channel_data_in +%= @intCast(data.len);
+        stats.scp_bytes_in +%= @intCast(data.len);
+        channel.last_activity_tick = app.sys.ticks();
+    }
     return switch (channel.scp_mode) {
         .source => handleScpSourceData(app, conn_id, stats, key, data, channel, buffers, rng, seq_out),
         .sink => handleScpSinkData(app, conn_id, stats, key, data, channel, buffers, rng, seq_out),
@@ -3286,16 +3452,16 @@ fn handleScpSourceData(app: *const App, conn_id: u32, stats: *ServiceStats, key:
                 channel.scp_state = .source_wait_header_ack;
             },
             .source_wait_header_ack => {
-                if (!sendScpFileData(app, conn_id, stats, key, buffers, rng, seq_out, channel)) {
+                channel.scp_state = .source_streaming;
+                if (!pumpScpSourceOutput(app, conn_id, stats, key, buffers, rng, seq_out, channel)) {
                     return sendScpErrorAndClose(app, conn_id, stats, key, buffers, rng, seq_out, channel, "scp source read failed");
                 }
-                channel.scp_state = .source_wait_final_ack;
             },
             .source_wait_final_ack => {
                 stats.scp_reads +%= 1;
                 channel.scp_state = .done;
-                sendChannelExitAndClose(app, conn_id, key, buffers, rng, seq_out, channel, 0);
-                return .close_session;
+                scheduleChannelClose(channel, 0);
+                return .continue_session;
             },
             else => return sendScpErrorAndClose(app, conn_id, stats, key, buffers, rng, seq_out, channel, "bad scp source state"),
         }
@@ -3304,13 +3470,16 @@ fn handleScpSourceData(app: *const App, conn_id: u32, stats: *ServiceStats, key:
 }
 
 fn handleScpSinkData(app: *const App, conn_id: u32, stats: *ServiceStats, key: []const u8, data: []const u8, channel: *ChannelState, buffers: *SessionBuffers, rng: *SessionRng, seq_out: *u32) ChannelAction {
-    if (channel.scp_input_len + data.len > buffers.sftp_input.len) {
-        return sendScpErrorAndClose(app, conn_id, stats, key, buffers, rng, seq_out, channel, "scp input too large");
+    if (data.len != 0) {
+        if (channel.scp_input_len + data.len > buffers.sftp_input.len) {
+            return sendScpErrorAndClose(app, conn_id, stats, key, buffers, rng, seq_out, channel, "scp input too large");
+        }
+        @memcpy(buffers.sftp_input[channel.scp_input_len .. channel.scp_input_len + data.len], data);
+        channel.scp_input_len += data.len;
     }
-    @memcpy(buffers.sftp_input[channel.scp_input_len .. channel.scp_input_len + data.len], data);
-    channel.scp_input_len += data.len;
 
     while (true) {
+        if (!buffers.channel_output.empty()) return .continue_session;
         switch (channel.scp_state) {
             .sink_wait_command => {
                 const line_end = indexOfByte(buffers.sftp_input[0..channel.scp_input_len], '\n') orelse return .continue_session;
@@ -3550,8 +3719,8 @@ fn handleScpSinkData(app: *const App, conn_id: u32, stats: *ServiceStats, key: [
                 noteTransfer(stats, "scp-sink", spanZ(channel.scp_path[0..]), @intCast(channel.scp_received_len), app.sys.ticks() - channel.transfer_start_tick, "ok");
                 channel.scp_state = .done;
                 if (!sendScpOk(app, conn_id, stats, key, buffers, rng, seq_out, channel)) return .protocol_error;
-                sendChannelExitAndClose(app, conn_id, key, buffers, rng, seq_out, channel, 0);
-                return .close_session;
+                scheduleChannelClose(channel, 0);
+                return .continue_session;
             },
             else => return sendScpErrorAndClose(app, conn_id, stats, key, buffers, rng, seq_out, channel, "bad scp sink state"),
         }
@@ -3572,40 +3741,41 @@ fn sendScpFileHeader(app: *const App, conn_id: u32, stats: *ServiceStats, key: [
     return sendScpBytes(app, conn_id, stats, key, buffers, rng, seq_out, channel.client_channel, header[0..pos]);
 }
 
-fn sendScpFileData(app: *const App, conn_id: u32, stats: *ServiceStats, key: []const u8, buffers: *SessionBuffers, rng: *SessionRng, seq_out: *u32, channel: *ChannelState) bool {
+fn pumpScpSourceOutput(app: *const App, conn_id: u32, stats: *ServiceStats, key: []const u8, buffers: *SessionBuffers, rng: *SessionRng, seq_out: *u32, channel: *ChannelState) bool {
+    if (channel.scp_state != .source_streaming or !buffers.channel_output.empty()) return true;
     var path_z: [sftp_path_capacity:0]u8 = .{0} ** sftp_path_capacity;
     copyFixedZ(path_z[0..], spanZ(channel.scp_path[0..]));
     if (channel.scp_expected_len == 0) {
         noteTransfer(stats, "scp-source", spanZ(channel.scp_path[0..]), 0, app.sys.ticks() - channel.transfer_start_tick, "ok");
-        return sendScpOk(app, conn_id, stats, key, buffers, rng, seq_out, channel);
+        if (!sendScpOk(app, conn_id, stats, key, buffers, rng, seq_out, channel)) return false;
+        channel.scp_state = .source_wait_final_ack;
+        return true;
     }
 
-    var offset: usize = 0;
-    while (offset < channel.scp_expected_len) {
-        const remaining = channel.scp_expected_len - offset;
-        const want = @min(@min(buffers.sftp_upload.len, scp_source_data_chunk_max), remaining);
-        const got_raw = app.sys.fileReadAt(&path_z, @intCast(offset), buffers.sftp_upload[0..want]);
-        if (got_raw <= 0) {
-            stats.transfer_failures +%= 1;
-            logTransferFailure(app, "scp-source", spanZ(channel.scp_path[0..]), @intCast(offset), @intCast(want), got_raw, "read");
-            noteTransfer(stats, "scp-source", spanZ(channel.scp_path[0..]), @intCast(offset), app.sys.ticks() - channel.transfer_start_tick, "read-failed");
-            return false;
-        }
-        const got: usize = @intCast(got_raw);
-        const final_chunk = offset + got >= channel.scp_expected_len;
-        if (final_chunk) {
-            var final_payload: [ssh_channel_output_chunk_max]u8 = .{0} ** ssh_channel_output_chunk_max;
-            @memcpy(final_payload[0..got], buffers.sftp_upload[0..got]);
-            final_payload[got] = 0;
-            if (!sendScpBytes(app, conn_id, stats, key, buffers, rng, seq_out, channel.client_channel, final_payload[0 .. got + 1])) return false;
-        } else {
-            if (!sendScpBytes(app, conn_id, stats, key, buffers, rng, seq_out, channel.client_channel, buffers.sftp_upload[0..got])) return false;
-        }
-        offset += got;
-        channel.scp_received_len = offset;
-        noteTransfer(stats, "scp-source", spanZ(channel.scp_path[0..]), @intCast(offset), app.sys.ticks() - channel.transfer_start_tick, "streaming");
+    const offset = channel.scp_received_len;
+    const remaining = channel.scp_expected_len - offset;
+    const want = @min(@min(buffers.sftp_upload.len, scp_source_data_chunk_max), remaining);
+    const got_raw = app.sys.fileReadAt(&path_z, @intCast(offset), buffers.sftp_upload[0..want]);
+    if (got_raw <= 0) {
+        stats.transfer_failures +%= 1;
+        logTransferFailure(app, "scp-source", spanZ(channel.scp_path[0..]), @intCast(offset), @intCast(want), got_raw, "read");
+        noteTransfer(stats, "scp-source", spanZ(channel.scp_path[0..]), @intCast(offset), app.sys.ticks() - channel.transfer_start_tick, "read-failed");
+        return false;
     }
-    noteTransfer(stats, "scp-source", spanZ(channel.scp_path[0..]), @intCast(offset), app.sys.ticks() - channel.transfer_start_tick, "ok");
+    const got: usize = @intCast(got_raw);
+    const next_offset = offset + got;
+    const final_chunk = next_offset >= channel.scp_expected_len;
+    if (final_chunk) {
+        var final_payload: [ssh_channel_output_chunk_max]u8 = .{0} ** ssh_channel_output_chunk_max;
+        @memcpy(final_payload[0..got], buffers.sftp_upload[0..got]);
+        final_payload[got] = 0;
+        if (!sendScpBytes(app, conn_id, stats, key, buffers, rng, seq_out, channel.client_channel, final_payload[0 .. got + 1])) return false;
+    } else if (!sendScpBytes(app, conn_id, stats, key, buffers, rng, seq_out, channel.client_channel, buffers.sftp_upload[0..got])) {
+        return false;
+    }
+    channel.scp_received_len = next_offset;
+    noteTransfer(stats, "scp-source", spanZ(channel.scp_path[0..]), @intCast(next_offset), app.sys.ticks() - channel.transfer_start_tick, if (final_chunk) "ok" else "streaming");
+    if (final_chunk) channel.scp_state = .source_wait_final_ack;
     return true;
 }
 
@@ -3624,21 +3794,19 @@ fn sendScpErrorAndClose(app: *const App, conn_id: u32, stats: *ServiceStats, key
     appendText(out[0..], &pos, message);
     appendText(out[0..], &pos, "\n");
     _ = sendScpBytes(app, conn_id, stats, key, buffers, rng, seq_out, channel.client_channel, out[0..pos]);
-    sendChannelExitAndClose(app, conn_id, key, buffers, rng, seq_out, channel, 1);
+    scheduleChannelClose(channel, 1);
     channel.scp_state = .done;
-    return .close_session;
+    return .continue_session;
 }
 
 fn sendScpBytes(app: *const App, conn_id: u32, stats: *ServiceStats, key: []const u8, buffers: *SessionBuffers, rng: *SessionRng, seq_out: *u32, recipient: u32, data: []const u8) bool {
-    var pos: usize = 0;
-    while (pos < data.len) {
-        const chunk_len = @min(ssh_channel_output_chunk_max, data.len - pos);
-        if (!sendChannelData(app, conn_id, key, buffers, rng, seq_out, recipient, data[pos .. pos + chunk_len])) return false;
-        stats.channel_data_out +%= @intCast(chunk_len);
-        stats.scp_bytes_out +%= @intCast(chunk_len);
-        pos += chunk_len;
-    }
-    return true;
+    _ = app;
+    _ = conn_id;
+    _ = key;
+    _ = rng;
+    _ = seq_out;
+    _ = recipient;
+    return queueChannelData(stats, buffers, data);
 }
 
 fn parseScpFileHeader(line: []const u8) ?ScpFileHeader {
@@ -3740,7 +3908,12 @@ fn indexOfByte(data: []const u8, needle: u8) ?usize {
 }
 
 fn pumpConsoleOutput(app: *const App, conn_id: u32, stats: *ServiceStats, key: []const u8, buffers: *SessionBuffers, rng: *SessionRng, seq_out: *u32, channel: *ChannelState) bool {
+    _ = conn_id;
+    _ = key;
+    _ = rng;
+    _ = seq_out;
     if (!channel.shell_started or channel.shell_instance == 0) return true;
+    if (!buffers.channel_output.empty()) return true;
     var state: r4os.abi.ConsoleState = .{};
     const state_rc = app.sys.consoleState(channel.shell_instance, &state);
     stats.last_console_state_rc = state_rc;
@@ -3791,6 +3964,8 @@ fn pumpConsoleOutput(app: *const App, conn_id: u32, stats: *ServiceStats, key: [
     var pos = start;
     var sent_any = false;
     var sent_len: usize = 0;
+    const queued_bytes = backspace_count * 3 + (got - start);
+    if (queued_bytes > buffers.channel_output.available()) return true;
     if (backspace_count != 0) {
         var bs_buf: [48]u8 = undefined;
         var remaining = backspace_count;
@@ -3802,8 +3977,7 @@ fn pumpConsoleOutput(app: *const App, conn_id: u32, stats: *ServiceStats, key: [
                 bs_buf[i * 3 + 1] = ' ';
                 bs_buf[i * 3 + 2] = 0x08;
             }
-            if (!sendChannelData(app, conn_id, key, buffers, rng, seq_out, channel.client_channel, bs_buf[0 .. n * 3])) return false;
-            stats.channel_data_out +%= @intCast(n * 3);
+            if (!queueChannelData(stats, buffers, bs_buf[0 .. n * 3])) return false;
             sent_len += n * 3;
             remaining -= n;
             sent_any = true;
@@ -3811,8 +3985,7 @@ fn pumpConsoleOutput(app: *const App, conn_id: u32, stats: *ServiceStats, key: [
     }
     while (pos < got) {
         const chunk_len = @min(ssh_channel_output_chunk_max, got - pos);
-        if (!sendChannelData(app, conn_id, key, buffers, rng, seq_out, channel.client_channel, buffers.console_output[pos .. pos + chunk_len])) return false;
-        stats.channel_data_out +%= @intCast(chunk_len);
+        if (!queueChannelData(stats, buffers, buffers.console_output[pos .. pos + chunk_len])) return false;
         sent_len += chunk_len;
         pos += chunk_len;
         sent_any = true;
@@ -3831,61 +4004,22 @@ fn pumpConsoleOutput(app: *const App, conn_id: u32, stats: *ServiceStats, key: [
     return true;
 }
 
-fn drainConsoleOutput(app: *const App, conn_id: u32, endpoint_handle: u32, stats: *ServiceStats, config: *const Config, key: []const u8, buffers: *SessionBuffers, rng: *SessionRng, seq_out: *u32, channel: *ChannelState) void {
-    var stable: u8 = 0;
-    var loops: u16 = 0;
-    var last_len = channel.last_output_len;
-    var last_revision = channel.last_console_revision;
-    while (loops < 160 and stable < 8) : (loops += 1) {
-        const endpoint_work = pumpServiceEndpointDuringSession(app, endpoint_handle, stats, config);
-        if (endpoint_work != 0) app.sys.sleepTicks(1);
-        const output_ok = pumpConsoleOutput(app, conn_id, stats, key, buffers, rng, seq_out, channel);
-        if (!output_ok) {
-            if (!pollEncryptedPacket(app, conn_id).alive) {
-                stats.channel_output_failures +%= 1;
-                setLastProtocolError(stats, "drain-client-disconnect");
-            }
-            stable = 0;
-            app.sys.sleepTicks(1);
-            continue;
-        }
-        if (endpoint_work != 0 or channel.last_output_len != last_len or channel.last_console_revision != last_revision) {
-            last_len = channel.last_output_len;
-            last_revision = channel.last_console_revision;
-            stable = 0;
-        } else {
-            stable += 1;
-        }
-        app.sys.sleepTicks(1);
-    }
-    _ = pumpServiceEndpointDuringSession(app, endpoint_handle, stats, config);
-    _ = pumpConsoleOutput(app, conn_id, stats, key, buffers, rng, seq_out, channel);
-}
-
-fn drainConsoleOutputForClose(app: *const App, conn_id: u32, endpoint_handle: u32, stats: *ServiceStats, config: *const Config, key: []const u8, buffers: *SessionBuffers, rng: *SessionRng, seq_out: *u32, channel: *ChannelState) void {
-    drainConsoleOutput(app, conn_id, endpoint_handle, stats, config, key, buffers, rng, seq_out, channel);
-    var waited: u64 = 0;
-    while (waited < client_flush_ticks) : (waited += 1) {
-        _ = pumpServiceEndpointDuringSession(app, endpoint_handle, stats, config);
-        _ = pumpConsoleOutput(app, conn_id, stats, key, buffers, rng, seq_out, channel);
-        app.sys.sleepTicks(1);
-    }
-}
-
 fn handleSftpChannelData(app: *const App, conn_id: u32, stats: *ServiceStats, config: *const Config, key: []const u8, data: []const u8, channel: *ChannelState, buffers: *SessionBuffers, rng: *SessionRng, seq_out: *u32) ChannelAction {
-    if (data.len == 0) return .continue_session;
     buffers.sftp_recipient_channel = channel.client_channel;
-    if (channel.sftp_input_len + data.len > buffers.sftp_input.len) {
-        stats.protocol_errors +%= 1;
-        setLastProtocolError(stats, "sftp-input-overflow");
-        return .protocol_error;
+    if (data.len != 0) {
+        if (channel.sftp_input_len + data.len > buffers.sftp_input.len) {
+            stats.protocol_errors +%= 1;
+            setLastProtocolError(stats, "sftp-input-overflow");
+            return .protocol_error;
+        }
+        @memcpy(buffers.sftp_input[channel.sftp_input_len .. channel.sftp_input_len + data.len], data);
+        channel.sftp_input_len += data.len;
+        stats.channel_data_in +%= @intCast(data.len);
+        stats.sftp_bytes_in +%= @intCast(data.len);
     }
-    @memcpy(buffers.sftp_input[channel.sftp_input_len .. channel.sftp_input_len + data.len], data);
-    channel.sftp_input_len += data.len;
-    stats.channel_data_in +%= @intCast(data.len);
-    stats.sftp_bytes_in +%= @intCast(data.len);
 
     while (channel.sftp_input_len >= 4) {
+        if (!buffers.channel_output.empty()) break;
         const packet_len_u32 = readBeU32(buffers.sftp_input[0..]);
         if (packet_len_u32 == 0 or packet_len_u32 > buffers.sftp_input.len - 4) {
             stats.protocol_errors +%= 1;
@@ -3905,6 +4039,7 @@ fn handleSftpChannelData(app: *const App, conn_id: u32, stats: *ServiceStats, co
             std.mem.copyForwards(u8, buffers.sftp_input[0..remaining], buffers.sftp_input[total_len .. total_len + remaining]);
         }
         channel.sftp_input_len = remaining;
+        if (!buffers.channel_output.empty()) break;
     }
 
     channel.last_activity_tick = app.sys.ticks();
@@ -4669,22 +4804,20 @@ fn sendSftpNameOne(app: *const App, conn_id: u32, stats: *ServiceStats, key: []c
 }
 
 fn sendSftpPrepared(app: *const App, conn_id: u32, stats: *ServiceStats, key: []const u8, buffers: *SessionBuffers, rng: *SessionRng, seq_out: *u32, body_len: usize) bool {
+    _ = app;
+    _ = conn_id;
+    _ = key;
+    _ = rng;
+    _ = seq_out;
     if (body_len + 4 > buffers.sftp_output.len or body_len > std.math.maxInt(u32)) {
         setLastProtocolError(stats, "sftp-out-size");
         return false;
     }
     writeBeU32(buffers.sftp_output[0..], @intCast(body_len));
     const packet = buffers.sftp_output[0 .. body_len + 4];
-    var pos: usize = 0;
-    while (pos < packet.len) {
-        const chunk_len = @min(ssh_channel_output_chunk_max, packet.len - pos);
-        if (!sendChannelData(app, conn_id, key, buffers, rng, seq_out, buffers.sftp_recipient_channel, packet[pos .. pos + chunk_len])) {
-            setLastProtocolError(stats, "sftp-send");
-            return false;
-        }
-        stats.channel_data_out +%= @intCast(chunk_len);
-        stats.sftp_bytes_out +%= @intCast(chunk_len);
-        pos += chunk_len;
+    if (!queueChannelData(stats, buffers, packet)) {
+        setLastProtocolError(stats, "sftp-output-backpressure");
+        return false;
     }
     return true;
 }
@@ -5551,13 +5684,14 @@ fn sendChannelRequestReply(app: *const App, conn_id: u32, key: []const u8, buffe
 fn ackChannelInputWindow(app: *const App, conn_id: u32, stats: *ServiceStats, key: []const u8, channel: *ChannelState, buffers: *SessionBuffers, rng: *SessionRng, seq_out: *u32, bytes: usize) bool {
     if (bytes == 0) return true;
     channel.channel_window_consumed += bytes;
-    if (channel.channel_window_consumed < ssh_channel_window_adjust_threshold) return true;
-    const adjust = channel.channel_window_consumed;
+    if (channel.channel_window_consumed < ssh_channel_window_adjust_threshold and channel.receive_window_remaining != 0) return true;
+    const adjust = @min(channel.channel_window_consumed, std.math.maxInt(u32));
     if (!sendChannelWindowAdjust(app, conn_id, key, buffers, rng, seq_out, channel.client_channel, adjust)) {
         setLastProtocolError(stats, "window-adjust-send");
         return false;
     }
-    channel.channel_window_consumed = 0;
+    channel.channel_window_consumed -= adjust;
+    channel.receive_window_remaining +|= @intCast(adjust);
     return true;
 }
 
@@ -5571,14 +5705,57 @@ fn sendChannelWindowAdjust(app: *const App, conn_id: u32, key: []const u8, buffe
     return sendEncryptedPacket(app, conn_id, key, w.slice(), buffers, rng, seq_out);
 }
 
-fn sendChannelData(app: *const App, conn_id: u32, key: []const u8, buffers: *SessionBuffers, rng: *SessionRng, seq_out: *u32, recipient: u32, data: []const u8) bool {
-    if (data.len == 0) return true;
+const ChannelOutputPump = enum {
+    idle,
+    progress,
+    blocked,
+    failed,
+};
+
+fn queueChannelData(stats: *ServiceStats, buffers: *SessionBuffers, data: []const u8) bool {
+    if (!buffers.channel_output.append(data)) return false;
+    const pending = buffers.channel_output.pending();
+    if (pending > stats.channel_output_queue_high_water) {
+        stats.channel_output_queue_high_water = @intCast(@min(pending, std.math.maxInt(u32)));
+    }
+    return true;
+}
+
+fn pumpChannelOutput(app: *const App, conn_id: u32, stats: *ServiceStats, key: []const u8, buffers: *SessionBuffers, rng: *SessionRng, seq_out: *u32, channel: *ChannelState) ChannelOutputPump {
+    const pending = buffers.channel_output.peek();
+    if (pending.len == 0) {
+        channel.send_window.clearBlocked();
+        return .idle;
+    }
+    const requested = @min(pending.len, ssh_channel_output_chunk_max);
+    const count = channel.send_window.budget(requested);
+    if (count == 0) {
+        if (channel.send_window.noteBlocked(app.sys.ticks())) stats.channel_window_blocks +%= 1;
+        return .blocked;
+    }
+    if (!sendChannelDataPacket(app, conn_id, key, buffers, rng, seq_out, channel.client_channel, pending[0..count])) return .failed;
+    if (!channel.send_window.consume(count) or !buffers.channel_output.consume(count)) return .failed;
+    stats.channel_data_out +%= @intCast(count);
+    if (channel.sftp_started) stats.sftp_bytes_out +%= @intCast(count);
+    if (channel.scp_started) stats.scp_bytes_out +%= @intCast(count);
+    channel.last_activity_tick = app.sys.ticks();
+    return .progress;
+}
+
+fn sendChannelDataPacket(app: *const App, conn_id: u32, key: []const u8, buffers: *SessionBuffers, rng: *SessionRng, seq_out: *u32, recipient: u32, data: []const u8) bool {
+    if (data.len == 0 or data.len > ssh_channel_output_chunk_max) return data.len == 0;
     var payload: [ssh_channel_output_chunk_max + 16]u8 = .{0} ** (ssh_channel_output_chunk_max + 16);
     var w = Writer.init(payload[0..]);
     if (!w.byte(ssh_msg_channel_data)) return false;
     if (!w.beU32(recipient)) return false;
     if (!w.string(data)) return false;
     return sendEncryptedPacket(app, conn_id, key, w.slice(), buffers, rng, seq_out);
+}
+
+fn scheduleChannelClose(channel: *ChannelState, exit_code: u32) void {
+    if (channel.close_after_output) return;
+    channel.close_after_output = true;
+    channel.close_after_output_status = exit_code;
 }
 
 fn sendChannelExitAndClose(app: *const App, conn_id: u32, key: []const u8, buffers: *SessionBuffers, rng: *SessionRng, seq_out: *u32, channel: *ChannelState, exit_code: u32) void {
@@ -5995,6 +6172,11 @@ fn pumpChannelDuringRead(app: *const App, conn_id: u32, pump: ?*ChannelReadPump)
     if (!pumpConsoleOutput(app, conn_id, context.stats, context.s2c_key, context.buffers, context.rng, context.seq_out, context.channel) and !pollEncryptedPacket(app, conn_id).alive) {
         context.stats.channel_output_failures +%= 1;
         setLastProtocolError(context.stats, "read-pump-client-disconnect");
+        return false;
+    }
+    if (pumpChannelOutput(app, conn_id, context.stats, context.s2c_key, context.buffers, context.rng, context.seq_out, context.channel) == .failed and !pollEncryptedPacket(app, conn_id).alive) {
+        context.stats.channel_output_failures +%= 1;
+        setLastProtocolError(context.stats, "read-pump-output");
         return false;
     }
     return true;
