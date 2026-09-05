@@ -3513,7 +3513,7 @@ fn handleScpSinkData(app: *const App, conn_id: u32, stats: *ServiceStats, key: [
                     return sendScpErrorAndClose(app, conn_id, stats, key, buffers, rng, seq_out, channel, "scp filename invalid");
                 }
                 noteTransfer(stats, "scp-sink", final_path, @intCast(header.size), 0, "header");
-                if (isDirectSystemWriteBlocked(final_path)) {
+                if (isDirectSystemWriteBlocked(app, final_path)) {
                     noteTransfer(stats, "scp-sink", final_path, 0, 0, "blocked-system-path");
                     return sendScpErrorAndClose(app, conn_id, stats, key, buffers, rng, seq_out, channel, "use update inbox");
                 }
@@ -4127,7 +4127,7 @@ fn handleSftpOpen(app: *const App, conn_id: u32, stats: *ServiceStats, config: *
         if (info.is_dir != 0) {
             return sendSftpStatus(app, conn_id, stats, key, buffers, rng, seq_out, id, sftp_status_failure, "is directory");
         }
-        if (isDirectSystemWriteBlocked(path)) {
+        if (isDirectSystemWriteBlocked(app, path)) {
             noteTransfer(stats, "sftp-write", path, 0, 0, "blocked-system-path");
             return sendSftpStatus(app, conn_id, stats, key, buffers, rng, seq_out, id, sftp_status_permission_denied, "use update inbox");
         }
@@ -4611,7 +4611,7 @@ fn handleSftpMkDir(app: *const App, conn_id: u32, stats: *ServiceStats, config: 
     const path = resolveSshFilePath(config, remote_path, path_z[0..]) orelse {
         return sendSftpStatus(app, conn_id, stats, key, buffers, rng, seq_out, id, sftp_status_no_such_file, "bad path");
     };
-    if (isDirectoryCreateBlocked(path)) {
+    if (isDirectoryCreateBlocked(app, path)) {
         noteTransfer(stats, "sftp-mkdir", path, 0, 0, "blocked-system-path");
         return sendSftpStatus(app, conn_id, stats, key, buffers, rng, seq_out, id, sftp_status_permission_denied, "use update inbox");
     }
@@ -4626,7 +4626,7 @@ fn handleSftpRemove(app: *const App, conn_id: u32, stats: *ServiceStats, config:
     const path = resolveSshFilePath(config, remote_path, path_z[0..]) orelse {
         return sendSftpStatus(app, conn_id, stats, key, buffers, rng, seq_out, id, sftp_status_no_such_file, "bad path");
     };
-    if (isDirectSystemWriteBlocked(path)) {
+    if (isDirectSystemWriteBlocked(app, path)) {
         noteTransfer(stats, "sftp-remove", path, 0, 0, "blocked-system-path");
         return sendSftpStatus(app, conn_id, stats, key, buffers, rng, seq_out, id, sftp_status_permission_denied, "use update inbox");
     }
@@ -4668,7 +4668,7 @@ fn handleSftpRmDir(app: *const App, conn_id: u32, stats: *ServiceStats, config: 
     const path = resolveSshFilePath(config, remote_path, path_z[0..]) orelse {
         return sendSftpStatus(app, conn_id, stats, key, buffers, rng, seq_out, id, sftp_status_no_such_file, "bad path");
     };
-    if (isDirectSystemWriteBlocked(path)) {
+    if (isDirectSystemWriteBlocked(app, path)) {
         noteTransfer(stats, "sftp-rmdir", path, 0, 0, "blocked-system-path");
         return sendSftpStatus(app, conn_id, stats, key, buffers, rng, seq_out, id, sftp_status_permission_denied, "use update inbox");
     }
@@ -4715,7 +4715,7 @@ fn handleSftpRename(app: *const App, conn_id: u32, stats: *ServiceStats, config:
     const new_path = resolveSshFilePath(config, new_remote, new_z[0..]) orelse {
         return sendSftpStatus(app, conn_id, stats, key, buffers, rng, seq_out, id, sftp_status_no_such_file, "bad new path");
     };
-    if (isDirectSystemWriteBlocked(old_path) or isDirectSystemWriteBlocked(new_path)) {
+    if (isDirectSystemWriteBlocked(app, old_path) or isDirectSystemWriteBlocked(app, new_path)) {
         noteTransfer(stats, "sftp-rename", new_path, 0, 0, "blocked-system-path");
         return sendSftpStatus(app, conn_id, stats, key, buffers, rng, seq_out, id, sftp_status_permission_denied, "use update inbox");
     }
@@ -5260,7 +5260,8 @@ fn noteTransferFailure(
     noteTransferResult(stats, kind, path, bytes, ticks, result, failure_rc, abort_rc);
 }
 
-fn isDirectSystemWriteBlocked(path: []const u8) bool {
+fn isDirectSystemWriteBlocked(app: *const App, path: []const u8) bool {
+    if (r4os.runtime_context.offlineRepairAllowed(&app.sys, path)) return false;
     if (isUpdateInboxFilePath(path)) return false;
     return isPathAtOrBelow(path, "C:\\R4OS") or
         isPathAtOrBelow(path, "C:\\BOOT") or
@@ -5273,9 +5274,9 @@ fn isDirectSystemWriteBlocked(path: []const u8) bool {
         isPathAtOrBelow(path, "D:\\LIMINE");
 }
 
-fn isDirectoryCreateBlocked(path: []const u8) bool {
+fn isDirectoryCreateBlocked(app: *const App, path: []const u8) bool {
     if (isUpdateDirectoryPath(path)) return false;
-    return isDirectSystemWriteBlocked(path);
+    return isDirectSystemWriteBlocked(app, path);
 }
 
 fn isUpdateInboxFilePath(path: []const u8) bool {

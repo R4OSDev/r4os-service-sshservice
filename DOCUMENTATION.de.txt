@@ -248,3 +248,17 @@ Write-Chunks werden nicht blind wiederholt, damit spaete TCPSVC-Antworten
 keine doppelten SSH-Pakete erzeugen. `SERVMAN STATUS SSHD` meldet dafuer
 `read_retry`, `write_retry`, `svc_retry`, `tcp_flags`, `tcp_status` und
 `tcp_result`.
+
+0.76.7: Recovery-Dateireparatur
+-----------------------------
+Der gemeinsame SDK-Laufzeitkontext erlaubt direkte Datei- und
+Verzeichnisaenderungen auf offline eingebundenen physischen Laufwerken,
+wenn das gestartete C: die Recovery-RAM-Laufzeit ist. Das schliesst BOOT/EFI
+auf D: ein. Die Regeln des normalen R4OS und fuer laufende RAM-Systemdateien
+bleiben bestehen. Alle Transferpfade verwenden dieselben Laufwerke wie die
+lokale Shell; /E/... entspricht beispielsweise E:\... .
+Der bestehende create-only Uploadvertrag bleibt erhalten: Vorhandene Ziele
+werden nicht stillschweigend ueberschrieben. Fuer eine gezielte Reparatur
+eine neue Datei hochladen und per SSH-COPY ersetzen oder ausdruecklich
+loeschen und neu uebertragen. Lesbarkeit, Hashes und Erfolg jeder Operation
+pruefen. SCP behaelt seinen vorhandenen begrenzten Einzeldateivertrag.
