@@ -508,6 +508,8 @@ const ScpState = enum(u8) {
 };
 
 const ChannelState = struct {
+    sftp_volume_use: u64 = 0,
+    scp_volume_use: u64 = 0,
     open: bool = false,
     pty: bool = false,
     shell_started: bool = false,
@@ -2695,6 +2697,11 @@ fn handleChannelOpen(app: *const App, conn_id: u32, stats: *ServiceStats, key: [
         return false;
     }
 
+    if (channel.open and !channel.close_sent) {
+        return sendChannelOpenFailure(app, conn_id, key, sender_channel, "one active channel per connection", buffers, rng, seq_out);
+    }
+    abortActiveTransfers(app, stats, channel, "channel-reopen");
+    if (channel.sftp_cleanup_pending or channel.scp_cleanup_pending) return false;
     const session_slot = channel.session_slot;
     channel.* = .{
         .open = true,
@@ -2829,7 +2836,7 @@ fn handleChannelRequest(app: *const App, conn_id: u32, stats: *ServiceStats, con
         }
         channel.sftp_started = true;
         channel.sftp_input_len = 0;
-        clearSftpHandle(channel);
+        clearSftpHandle(app, channel);
         channel.last_activity_tick = app.sys.ticks();
         channel.transfer_start_tick = channel.last_activity_tick;
         noteSessionKind(stats, "sftp", "");
@@ -3329,7 +3336,7 @@ fn startScpExec(app: *const App, stats: *ServiceStats, config: *const Config, ch
         setLastProtocolError(stats, "scp-args");
         return false;
     };
-    clearScpState(channel);
+    clearScpState(app, channel);
     return switch (parsed.mode) {
         .source => startScpSource(app, stats, config, channel, buffers, parsed, command),
         .sink => startScpSink(app, stats, config, channel, parsed, command),
@@ -3344,6 +3351,13 @@ fn startScpSource(app: *const App, stats: *ServiceStats, config: *const Config, 
         setLastProtocolError(stats, "scp-source-path");
         return false;
     };
+    const storage = r4os.storage.Context{ .sys = &app.sys };
+    var volume_use: u64 = 0;
+    if (storage.transferUseBegin(&path_z, &volume_use) != 0) {
+        setLastProtocolError(stats, "scp-volume-busy");
+        return false;
+    }
+    defer _ = storage.useEnd(&volume_use);
     const info = app.sys.fileInfo(&path_z) orelse {
         setLastProtocolError(stats, "scp-source-missing");
         return false;
@@ -3365,6 +3379,8 @@ fn startScpSource(app: *const App, stats: *ServiceStats, config: *const Config, 
         return false;
     }
     copyFixedZ(channel.scp_path[0..], path);
+    channel.scp_volume_use = volume_use;
+    volume_use = 0;
     channel.scp_started = true;
     channel.exec_started = true;
     channel.scp_mode = .source;
@@ -3391,6 +3407,13 @@ fn startScpSink(app: *const App, stats: *ServiceStats, config: *const Config, ch
         setLastProtocolError(stats, "scp-sink-path");
         return false;
     };
+    const storage = r4os.storage.Context{ .sys = &app.sys };
+    var volume_use: u64 = 0;
+    if (storage.transferUseBegin(&path_z, &volume_use) != 0) {
+        setLastProtocolError(stats, "scp-volume-busy");
+        return false;
+    }
+    defer _ = storage.useEnd(&volume_use);
     var info: r4os.abi.FileInfo = .{};
     const info_rc = app.sys.fileInfoRaw(&path_z, &info);
     if (info_rc < 0 or (info_rc > 0 and info.exists == 0)) {
@@ -3408,6 +3431,8 @@ fn startScpSink(app: *const App, stats: *ServiceStats, config: *const Config, ch
 
     copyFixedZ(channel.scp_path[0..], path);
     channel.scp_target_is_dir = target_is_dir;
+    channel.scp_volume_use = volume_use;
+    volume_use = 0;
     channel.scp_started = true;
     channel.exec_started = true;
     channel.scp_mode = .sink;
@@ -3460,6 +3485,7 @@ fn handleScpSourceData(app: *const App, conn_id: u32, stats: *ServiceStats, key:
             .source_wait_final_ack => {
                 stats.scp_reads +%= 1;
                 channel.scp_state = .done;
+                _ = (r4os.storage.Context{ .sys = &app.sys }).useEnd(&channel.scp_volume_use);
                 scheduleChannelClose(channel, 0);
                 return .continue_session;
             },
@@ -3718,6 +3744,7 @@ fn handleScpSinkData(app: *const App, conn_id: u32, stats: *ServiceStats, key: [
                 stats.scp_writes +%= 1;
                 noteTransfer(stats, "scp-sink", spanZ(channel.scp_path[0..]), @intCast(channel.scp_received_len), app.sys.ticks() - channel.transfer_start_tick, "ok");
                 channel.scp_state = .done;
+                _ = (r4os.storage.Context{ .sys = &app.sys }).useEnd(&channel.scp_volume_use);
                 if (!sendScpOk(app, conn_id, stats, key, buffers, rng, seq_out, channel)) return .protocol_error;
                 scheduleChannelClose(channel, 0);
                 return .continue_session;
@@ -3796,6 +3823,7 @@ fn sendScpErrorAndClose(app: *const App, conn_id: u32, stats: *ServiceStats, key
     _ = sendScpBytes(app, conn_id, stats, key, buffers, rng, seq_out, channel.client_channel, out[0..pos]);
     scheduleChannelClose(channel, 1);
     channel.scp_state = .done;
+    _ = (r4os.storage.Context{ .sys = &app.sys }).useEnd(&channel.scp_volume_use);
     return .continue_session;
 }
 
@@ -3849,7 +3877,8 @@ fn consumeScpInput(channel: *ChannelState, buffers: *SessionBuffers, len: usize)
     channel.scp_input_len = remaining;
 }
 
-fn clearScpState(channel: *ChannelState) void {
+fn clearScpState(app: *const App, channel: *ChannelState) void {
+    _ = (r4os.storage.Context{ .sys = &app.sys }).useEnd(&channel.scp_volume_use);
     channel.scp_started = false;
     channel.scp_mode = .none;
     channel.scp_state = .none;
@@ -4097,6 +4126,11 @@ fn handleSftpOpen(app: *const App, conn_id: u32, stats: *ServiceStats, config: *
     const path = resolveSshFilePath(config, remote_path, path_z[0..]) orelse {
         return sendSftpStatus(app, conn_id, stats, key, buffers, rng, seq_out, id, sftp_status_no_such_file, "bad path");
     };
+    const storage = r4os.storage.Context{ .sys = &app.sys };
+    var volume_use: u64 = 0;
+    if (storage.transferUseBegin(&path_z, &volume_use) != 0)
+        return sendSftpStatus(app, conn_id, stats, key, buffers, rng, seq_out, id, sftp_status_failure, "volume busy or unavailable");
+    defer _ = storage.useEnd(&volume_use);
     const wants_write = (pflags & sftp_pflag_write) != 0;
     const wants_read = (pflags & sftp_pflag_read) != 0;
 
@@ -4136,9 +4170,11 @@ fn handleSftpOpen(app: *const App, conn_id: u32, stats: *ServiceStats, config: *
         if (staging_rc != r4os.abi.file_stream_result_ok) {
             stats.transfer_failures +%= 1;
             noteTransferFailure(stats, "sftp-write", path, 0, 0, "stage-name-unavailable", staging_rc, 0);
-            clearSftpHandle(channel);
+            clearSftpHandle(app, channel);
             return sendSftpStatus(app, conn_id, stats, key, buffers, rng, seq_out, id, sftp_status_failure, "staging unavailable");
         }
+        channel.sftp_volume_use = volume_use;
+        volume_use = 0;
         channel.sftp_handle_kind = .write_file;
         channel.sftp_upload_len = 0;
         channel.sftp_write_offset = 0;
@@ -4174,7 +4210,7 @@ fn handleSftpOpen(app: *const App, conn_id: u32, stats: *ServiceStats, config: *
             // If Abort itself was ambiguous, retain the internal busy handle
             // and stage path. A later CLOSE/session teardown can retry, and
             // this ProgramThread's lifecycle sweep is the final backstop.
-            if (!channel.sftp_cleanup_pending) clearSftpHandle(channel);
+            if (!channel.sftp_cleanup_pending) clearSftpHandle(app, channel);
             syncSessionWatch(channel.session_slot, channel);
             return sendSftpStatus(app, conn_id, stats, key, buffers, rng, seq_out, id, sftp_status_failure, "stream begin failed");
         }
@@ -4205,6 +4241,8 @@ fn handleSftpOpen(app: *const App, conn_id: u32, stats: *ServiceStats, config: *
             return sendSftpStatus(app, conn_id, stats, key, buffers, rng, seq_out, id, sftp_status_failure, "is directory");
         }
         copyFixedZ(channel.sftp_path[0..], path);
+        channel.sftp_volume_use = volume_use;
+        volume_use = 0;
         channel.sftp_handle_kind = .read_file;
         channel.sftp_upload_len = 0;
         channel.sftp_write_offset = 0;
@@ -4232,17 +4270,17 @@ fn handleSftpClose(app: *const App, conn_id: u32, stats: *ServiceStats, key: []c
                 cleanup_rc = cleanupSftpWriteStage(app, stats, channel);
             }
             if (cleanup_rc != r4os.abi.file_stream_result_ok) {
-                if (!channel.sftp_cleanup_pending) clearSftpHandle(channel);
+                if (!channel.sftp_cleanup_pending) clearSftpHandle(app, channel);
                 return sendSftpStatus(app, conn_id, stats, key, buffers, rng, seq_out, id, sftp_status_failure, "stage cleanup failed");
             }
             if (channel.sftp_abort_rc != r4os.abi.file_stream_result_ok) {
-                if (!channel.sftp_cleanup_pending) clearSftpHandle(channel);
+                if (!channel.sftp_cleanup_pending) clearSftpHandle(app, channel);
                 return sendSftpStatus(app, conn_id, stats, key, buffers, rng, seq_out, id, sftp_status_failure, "stage retained");
             }
             // WRITE already carried the primary error. A clean CLOSE must
             // retire the still-valid handle without adding a misleading
             // second "bad handle" failure.
-            clearSftpHandle(channel);
+            clearSftpHandle(app, channel);
             return sendSftpStatus(app, conn_id, stats, key, buffers, rng, seq_out, id, sftp_status_ok, "failed write cleaned");
         }
 
@@ -4264,7 +4302,7 @@ fn handleSftpClose(app: *const App, conn_id: u32, stats: *ServiceStats, key: []c
                     // caller's stage. A deterministic EXISTS belongs to another
                     // session (or a stale file) and must never trigger Abort.
                     failSftpWrite(app, stats, channel, begin_rc, "stream-begin-failed", begin_rc == r4os.abi.file_stream_error_io);
-                    if (!channel.sftp_cleanup_pending) clearSftpHandle(channel);
+                    if (!channel.sftp_cleanup_pending) clearSftpHandle(app, channel);
                     return sendSftpStatus(app, conn_id, stats, key, buffers, rng, seq_out, id, sftp_status_failure, "stream begin failed");
                 }
                 channel.sftp_stream_active = true;
@@ -4281,7 +4319,7 @@ fn handleSftpClose(app: *const App, conn_id: u32, stats: *ServiceStats, key: []c
             if (finish_rc != r4os.abi.file_stream_result_ok) {
                 stats.transfer_failures +%= 1;
                 failSftpWrite(app, stats, channel, finish_rc, "stream-finish-failed", true);
-                if (!channel.sftp_cleanup_pending) clearSftpHandle(channel);
+                if (!channel.sftp_cleanup_pending) clearSftpHandle(app, channel);
                 return sendSftpStatus(app, conn_id, stats, key, buffers, rng, seq_out, id, sftp_status_failure, "stream finish failed");
             }
             channel.sftp_cleanup_pending = true;
@@ -4303,7 +4341,7 @@ fn handleSftpClose(app: *const App, conn_id: u32, stats: *ServiceStats, key: []c
             channel.sftp_publish_pending = false;
             channel.sftp_cleanup_pending = false;
             noteTransfer(stats, "sftp-write", spanZ(channel.sftp_path[0..]), channel.sftp_write_offset, app.sys.ticks() - channel.transfer_start_tick, "ok");
-            clearSftpHandle(channel);
+            clearSftpHandle(app, channel);
             return sendSftpStatus(app, conn_id, stats, key, buffers, rng, seq_out, id, sftp_status_ok, "ok");
         }
 
@@ -4316,7 +4354,7 @@ fn handleSftpClose(app: *const App, conn_id: u32, stats: *ServiceStats, key: []c
             const reconcile_rc = cleanupSftpWriteStage(app, stats, channel);
             if (reconcile_rc == r4os.abi.file_stream_result_ok) {
                 noteTransfer(stats, "sftp-write", spanZ(channel.sftp_path[0..]), channel.sftp_write_offset, app.sys.ticks() - channel.transfer_start_tick, "ok-reconciled");
-                clearSftpHandle(channel);
+                clearSftpHandle(app, channel);
                 return sendSftpStatus(app, conn_id, stats, key, buffers, rng, seq_out, id, sftp_status_ok, "ok");
             }
             stats.transfer_failures +%= 1;
@@ -4348,11 +4386,11 @@ fn handleSftpClose(app: *const App, conn_id: u32, stats: *ServiceStats, key: []c
             channel.sftp_failure_rc,
             channel.sftp_abort_rc,
         );
-        if (!channel.sftp_cleanup_pending) clearSftpHandle(channel);
+        if (!channel.sftp_cleanup_pending) clearSftpHandle(app, channel);
         return sendSftpStatus(app, conn_id, stats, key, buffers, rng, seq_out, id, sftp_status_failure, "atomic publish failed");
     }
 
-    clearSftpHandle(channel);
+    clearSftpHandle(app, channel);
     return sendSftpStatus(app, conn_id, stats, key, buffers, rng, seq_out, id, sftp_status_ok, "ok");
 }
 
@@ -4496,6 +4534,11 @@ fn handleSftpOpenDir(app: *const App, conn_id: u32, stats: *ServiceStats, config
     const path = resolveSshFilePath(config, remote_path, path_z[0..]) orelse {
         return sendSftpStatus(app, conn_id, stats, key, buffers, rng, seq_out, id, sftp_status_no_such_file, "bad path");
     };
+    const storage = r4os.storage.Context{ .sys = &app.sys };
+    var volume_use: u64 = 0;
+    if (storage.transferUseBegin(&path_z, &volume_use) != 0)
+        return sendSftpStatus(app, conn_id, stats, key, buffers, rng, seq_out, id, sftp_status_failure, "volume busy or unavailable");
+    defer _ = storage.useEnd(&volume_use);
     var info: r4os.abi.FileInfo = .{};
     const info_rc = app.sys.fileInfoRaw(&path_z, &info);
     if (info_rc < 0) {
@@ -4511,6 +4554,8 @@ fn handleSftpOpenDir(app: *const App, conn_id: u32, stats: *ServiceStats, config
         return sendSftpStatus(app, conn_id, stats, key, buffers, rng, seq_out, id, sftp_status_no_such_file, "not directory");
     }
     copyFixedZ(channel.sftp_path[0..], path);
+    channel.sftp_volume_use = volume_use;
+    volume_use = 0;
     channel.sftp_handle_kind = .dir;
     channel.sftp_dir_index = 2;
     stats.sftp_opens +%= 1;
@@ -5060,7 +5105,8 @@ fn failSftpWrite(app: *const App, stats: *ServiceStats, channel: *ChannelState, 
     );
 }
 
-fn clearSftpHandle(channel: *ChannelState) void {
+fn clearSftpHandle(app: *const App, channel: *ChannelState) void {
+    _ = (r4os.storage.Context{ .sys = &app.sys }).useEnd(&channel.sftp_volume_use);
     channel.sftp_handle_kind = .none;
     channel.sftp_upload_len = 0;
     channel.sftp_write_offset = 0;
@@ -5140,7 +5186,11 @@ fn abortActiveTransfers(app: *const App, stats: *ServiceStats, channel: *Channel
         stats.transfer_aborts +%= 1;
         noteTransfer(stats, "scp-sink", spanZ(channel.scp_path[0..]), @intCast(channel.scp_received_len), app.sys.ticks() - channel.transfer_start_tick, reason);
         channel.scp_state = .done;
+        _ = (r4os.storage.Context{ .sys = &app.sys }).useEnd(&channel.scp_volume_use);
     }
+    const storage = r4os.storage.Context{ .sys = &app.sys };
+    _ = storage.useEnd(&channel.sftp_volume_use);
+    _ = storage.useEnd(&channel.scp_volume_use);
 }
 
 fn writeTransferChunks(app: *const App, channel: *ChannelState, path: [*:0]const u8, start_offset: u64, data: []const u8, last_rc: *i32) usize {
@@ -5464,7 +5514,12 @@ fn pollEncryptedPacket(app: *const App, conn_id: u32) EncryptedPacketPoll {
 }
 
 fn tcpPollServiceResultWaitRaw(app: *const App, conn_id: u32, out: *r4os.abi.NetServiceTcpResult, wait_ticks: u64) i32 {
-    return tcpPollServiceWaitLocked(app, conn_id, out, wait_ticks);
+    const rc = tcpPollServiceWaitLocked(app, conn_id, out, wait_ticks);
+    // The SDK also returns -1 for a successfully received terminal socket
+    // result. Preserve that structured result for every caller's lifecycle
+    // check instead of classifying a dead peer as transient service failure.
+    if (tcpLifecycleTerminal(out.lifecycle_cause)) return 0;
+    return rc;
 }
 
 fn tcpServiceStatusCode(result: *const r4os.abi.NetServiceTcpResult) u32 {

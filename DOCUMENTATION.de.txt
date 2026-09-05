@@ -262,3 +262,16 @@ werden nicht stillschweigend ueberschrieben. Fuer eine gezielte Reparatur
 eine neue Datei hochladen und per SSH-COPY ersetzen oder ausdruecklich
 loeschen und neu uebertragen. Lesbarkeit, Hashes und Erfolg jeder Operation
 pruefen. SCP behaelt seinen vorhandenen begrenzten Einzeldateivertrag.
+
+0.76.8: Gemeinsame Offline-Volume-Nutzungen
+----------------------------------------
+SFTP OPEN/OPENDIR und SCP-Quelle/-Ziel halten ueber r4os.storage einen Use auf
+dem wirklichen Zielvolume. CLOSE, Transferabschluss, Abbruch und Sitzungsende
+gleichen den Erwerb ab. Waehrend einer exklusiven Storageoperation wird ein
+neuer Zugriff abgewiesen. Die bestehenden Kernel-Streams bleiben zusaetzlich
+bis zu ihrem bestaetigten Abschluss geschuetzt. Ein zweiter aktiver SSH-Kanal
+darf den bereits gehaltenen Kanalzustand nicht ueberschreiben.
+
+Ein terminaler TCP-Poll mit strukturierter Closed-/Reset-/Peer-Gone-Antwort
+wird auch bei negativem SDK-Rueckgabecode ausgewertet. Er gilt nicht als
+voruebergehender Dienstfehler und laesst keine tote Sitzung/Belegung stehen.
