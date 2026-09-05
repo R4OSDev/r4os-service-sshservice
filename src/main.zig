@@ -3943,6 +3943,11 @@ fn pumpConsoleOutput(app: *const App, conn_id: u32, stats: *ServiceStats, key: [
     _ = seq_out;
     if (!channel.shell_started or channel.shell_instance == 0) return true;
     if (!buffers.channel_output.empty()) return true;
+    // State counters and transcript bytes are separate kernel calls. A
+    // producer can append between them; combining old counters with newer
+    // bytes replays a prefix on the next pump. Accept one stable revision,
+    // otherwise retry on the next service iteration without moving cursors.
+    const revision = app.sys.consoleRevision(channel.shell_instance);
     var state: r4os.abi.ConsoleState = .{};
     const state_rc = app.sys.consoleState(channel.shell_instance, &state);
     stats.last_console_state_rc = state_rc;
@@ -3955,6 +3960,8 @@ fn pumpConsoleOutput(app: *const App, conn_id: u32, stats: *ServiceStats, key: [
         return false;
     }
     const got: usize = @intCast(got_raw);
+    if (app.sys.consoleRevision(channel.shell_instance) != revision or
+        got != @min(@as(usize, state.output_len), buffers.console_output.len - 1)) return true;
     stats.last_console_read_len = @intCast(@min(got, std.math.maxInt(u32)));
     const stream_bytes = state.stdout_bytes +% state.stderr_bytes;
     const stream_delta = stream_bytes -% channel.last_console_stream_bytes;
@@ -4027,7 +4034,7 @@ fn pumpConsoleOutput(app: *const App, conn_id: u32, stats: *ServiceStats, key: [
         if (channel.exec_started and (stream_bytes != 0 or sent_any)) channel.exec_output_observed = true;
     }
     channel.last_output_len = @intCast(got);
-    channel.last_console_revision = app.sys.consoleRevision(channel.shell_instance);
+    channel.last_console_revision = revision;
     channel.last_console_stream_bytes = stream_bytes;
     channel.last_output_dropped_bytes = state.output_dropped_bytes;
     return true;

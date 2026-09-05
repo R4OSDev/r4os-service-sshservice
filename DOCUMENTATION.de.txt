@@ -275,3 +275,9 @@ darf den bereits gehaltenen Kanalzustand nicht ueberschreiben.
 Ein terminaler TCP-Poll mit strukturierter Closed-/Reset-/Peer-Gone-Antwort
 wird auch bei negativem SDK-Rueckgabecode ausgewertet. Er gilt nicht als
 voruebergehender Dienstfehler und laesst keine tote Sitzung/Belegung stehen.
+
+0.76.10: Konsolenausgabe bindet Zustandszaehler und gelesenen Text an dieselbe
+Konsolenrevision. Aenderungen zwischen den getrennten API-Aufrufen werden
+ohne Cursorfortschritt beim naechsten Servicezyklus erneut gelesen. Dadurch
+wird schneller R4PART-Output nicht mit aelteren Zaehlern kombiniert und
+nicht im folgenden Durchlauf nochmals als frischer Text gesendet.
