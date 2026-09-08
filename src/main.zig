@@ -54,22 +54,13 @@ const accept_burst_max: usize = 4;
 const accept_idle_poll_ms: u64 = 100;
 const session_worker_stack_bytes: u64 = 2 * 1024 * 1024;
 var ssh_crypto_lock: u32 = 0;
-var tcp_service_lock: u32 = 0;
 var sftp_stage_nonce_lock: u32 = 0;
 var sftp_stage_nonce: u32 = 0;
 var transfer_event_sequence: u64 = 0;
-// 0.56.5: Eigener Lock NUR fuer den Accept-Poll des Main-Loops, getrennt
-// vom tcp_service_lock der Session-Worker-I/O. Vorher serialisierte EIN
-// globaler Lock Accept UND Worker-I/O: waehrend ein Worker sendet
-// (Banner/KEX, bis ~150 ms unterm Lock), kam der Main-Loop nicht an den
-// Accept -> bei mehreren schnellen Verbindungen wurden established-
-// Verbindungen zu spaet geclaimt (Kernel acc=N, SSHD accepted<<N,
-// Client-Banner-Timeout). Der Kernel-Endpoint-Layer serialisiert intern
-// bereits pro Operation (registry_lock) und ordnet Antworten per
-// request_id zu; die SSHD-seitige Accept-vs-Worker-Serialisierung ist
-// fuer die Korrektheit redundant. Accept hat nur EINEN Aufrufer
-// (Main-Loop) -> dieser Lock ist praktisch nie contended.
-var tcp_accept_lock: u32 = 0;
+// Each session worker owns its connection, packet buffers and sequence state
+// until Join. TCPSVC requests have caller-local response storage and request
+// IDs; a waiting call must not retain an SSHD-wide network lock. The parent
+// may abort a connection through TCPSVC, but never writes session payloads.
 const session_slow_warn_ms: u64 = 30 * 1000;
 const session_stop_join_ticks: u64 = 120;
 const session_timeout_ms: u64 = 30000;
@@ -90,15 +81,8 @@ const channel_window_stall_timeout_ms: u64 = 30000;
 const transfer_idle_timeout_ms: u64 = 120 * 1000;
 const transfer_packet_total_timeout_ms: u64 = 120 * 1000;
 const tcp_service_wait_ms: u64 = 5000;
-// 0.56.2: accept/call-Wait 50/100 -> 150 ms. Der Wait ist die OBERGRENZE
-// des Wartens auf die TCPSVC-Antwort (Completion weckt sofort); mit dem
-// gesunden TX/RX-Pfad kommen Antworten in wenigen ms. 50 ms verpasste
-// unter Scheduler-Last einen Teil der Accept-Antworten -> Cancel ->
-// die bereits geclaimte Verbindung verwaiste (Kernel acc=9, SSHD
-// accepted=1..4). NICHT wieder auf 500 ms setzen: laeuft der Wait doch
-// einmal voll (Antwort klemmt), haelt er solange den globalen
-// tcp_service_lock und verhungert Accept + Worker-I/O (frueherer
-// 500-ms-Fehlversuch in dieser Unterversion).
+// Cap individual polling/write service calls. The session's existing total
+// budget and tx-sequence reconciliation still govern retries and progress.
 const tcp_service_call_wait_ms: u64 = 150;
 const tcp_write_wait_ms: u64 = 15000;
 const transfer_tcp_service_wait_ms: u64 = 5000;
@@ -1140,7 +1124,7 @@ fn pollClient(app: *const App, stats: *ServiceStats, config: *const Config, host
     var accept: r4os.abi.TcpAcceptResult = .{};
     var structured: r4os.abi.NetServiceTcpResult = .{};
     stats.accept_polls +%= 1;
-    const rc = tcpAcceptPollServiceResultWaitLocked(app, config.listen_port, &accept, &structured, tcpAcceptServiceWaitTicks(app));
+    const rc = tcpAcceptPollServiceResultWait(app, config.listen_port, &accept, &structured, tcpAcceptServiceWaitTicks(app));
     stats.last_tcp_result = if (rc == 0) structured.result else rc;
     stats.last_accept_flags = structured.flags;
     if (structured.handle != 0) stats.last_accept_handle = structured.handle;
@@ -1413,7 +1397,7 @@ fn pollSessionWorkers(app: *const App, stats: *ServiceStats, sessions: []Session
         {
             @atomicStore(u32, &slot.transfer_active, 0, .release);
             var abort_result: r4os.abi.NetServiceTcpResult = .{};
-            const abort_rc = tcpAbortServiceResultWaitLocked(app, slot.conn_id, &abort_result, transferTcpServiceWaitTicks(app));
+            const abort_rc = tcpAbortServiceResultWait(app, slot.conn_id, &abort_result, transferTcpServiceWaitTicks(app));
             const watchdog_result = if (abort_rc == 0) abort_result.result else abort_rc;
             @atomicStore(i32, &slot.watchdog_abort_result, watchdog_result, .release);
             // Publish completion only after the result. State 1 means the
@@ -1444,7 +1428,7 @@ fn pollSessionWorkers(app: *const App, stats: *ServiceStats, sessions: []Session
 fn stopSessionWorkers(app: *const App, stats: *ServiceStats, sessions: []SessionWorkerSlot) void {
     var i: usize = 0;
     while (i < sessions.len) : (i += 1) {
-        if (sessions[i].used and sessions[i].conn_id != 0) _ = tcpAbortServiceWaitLocked(app, sessions[i].conn_id, tcpServiceCleanupWaitTicks(app));
+        if (sessions[i].used and sessions[i].conn_id != 0) _ = tcpAbortServiceWait(app, sessions[i].conn_id, tcpServiceCleanupWaitTicks(app));
     }
     var waited: u32 = 0;
     while (waited < 8 and stats.active_sessions != 0) : (waited += 1) {
@@ -1456,14 +1440,14 @@ fn stopSessionWorkers(app: *const App, stats: *ServiceStats, sessions: []Session
 fn finishTcpSession(app: *const App, slot: *SessionWorkerSlot, force_abort: bool) void {
     if (!force_abort) {
         var close_result: r4os.abi.NetServiceTcpResult = .{};
-        const close_rc = tcpCloseServiceResultWaitLocked(app, slot.conn_id, &close_result, tcpServiceCleanupWaitTicks(app));
+        const close_rc = tcpCloseServiceResultWait(app, slot.conn_id, &close_result, tcpServiceCleanupWaitTicks(app));
         slot.close_result = if (close_rc == 0) close_result.result else close_rc;
         slot.close_ok = close_rc == 0 and close_result.result == r4os.abi.tcp_result_ok;
         if (slot.close_ok) return;
     }
 
     var abort_result: r4os.abi.NetServiceTcpResult = .{};
-    const abort_rc = tcpAbortServiceResultWaitLocked(app, slot.conn_id, &abort_result, tcpServiceCleanupWaitTicks(app));
+    const abort_rc = tcpAbortServiceResultWait(app, slot.conn_id, &abort_result, tcpServiceCleanupWaitTicks(app));
     slot.close_result = if (abort_rc == 0) abort_result.result else abort_rc;
     slot.close_ok = abort_rc == 0 and (abort_result.result == r4os.abi.tcp_result_ok or abort_result.result == r4os.abi.tcp_result_no_connection);
 }
@@ -1679,7 +1663,7 @@ fn waitForListen(app: *const App, port: u16, stats: *ServiceStats) bool {
     var waited: u32 = 0;
     while (waited < listen_wait_ticks) : (waited += 1) {
         var result: r4os.abi.NetServiceTcpResult = .{};
-        const rc = tcpListenServiceResultWaitLocked(app, port, &result, tcpServiceWaitTicks(app));
+        const rc = tcpListenServiceResultWait(app, port, &result, tcpServiceWaitTicks(app));
         stats.last_tcp_result = if (rc == 0) result.result else rc;
         if (rc == 0 and result.result == 0) {
             app.sys.write("SSHD listen ");
@@ -1699,7 +1683,7 @@ fn waitForListen(app: *const App, port: u16, stats: *ServiceStats) bool {
 }
 
 fn closeListener(app: *const App, port: u16) void {
-    _ = tcpCloseListenServiceLocked(app, port);
+    _ = tcpCloseListenService(app, port);
 }
 
 fn tcpServiceWaitTicks(app: *const App) u64 {
@@ -1737,68 +1721,40 @@ fn tcpServiceCallWaitTicks(app: *const App, requested: u64) u64 {
     return @min(requested, if (cap == 0) 1 else cap);
 }
 
-fn acquireTcpServiceLock(app: *const App) void {
-    acquireAtomicLock(app, &tcp_service_lock);
-}
-
-fn releaseTcpServiceLock() void {
-    releaseAtomicLock(&tcp_service_lock);
-}
-
-fn tcpAcceptPollServiceResultWaitLocked(app: *const App, port: u16, accept: *r4os.abi.TcpAcceptResult, result: *r4os.abi.NetServiceTcpResult, wait_ticks: u64) i32 {
-    // 0.56.5: eigener Accept-Lock statt tcp_service_lock (siehe Deklaration).
-    // Wait ohne tcpServiceCallWaitTicks-Cap: die Accept-Kadenz wird allein
-    // ueber tcp_accept_service_wait_ms gesteuert (Begruendung dort).
-    acquireAtomicLock(app, &tcp_accept_lock);
-    defer releaseAtomicLock(&tcp_accept_lock);
+fn tcpAcceptPollServiceResultWait(app: *const App, port: u16, accept: *r4os.abi.TcpAcceptResult, result: *r4os.abi.NetServiceTcpResult, wait_ticks: u64) i32 {
+    // Only the main loop accepts; its existing cadence and wait budget remain.
     return app.net.tcpAcceptPollServiceResultWait(port, accept, result, wait_ticks);
 }
 
-fn tcpListenServiceResultWaitLocked(app: *const App, port: u16, result: *r4os.abi.NetServiceTcpResult, wait_ticks: u64) i32 {
-    acquireTcpServiceLock(app);
-    defer releaseTcpServiceLock();
+fn tcpListenServiceResultWait(app: *const App, port: u16, result: *r4os.abi.NetServiceTcpResult, wait_ticks: u64) i32 {
     return app.net.tcpListenServiceResultWait(port, result, wait_ticks);
 }
 
-fn tcpCloseListenServiceLocked(app: *const App, port: u16) i32 {
-    acquireTcpServiceLock(app);
-    defer releaseTcpServiceLock();
+fn tcpCloseListenService(app: *const App, port: u16) i32 {
     return app.net.tcpCloseListenService(port);
 }
 
-fn tcpCloseServiceResultWaitLocked(app: *const App, conn_id: u32, result: *r4os.abi.NetServiceTcpResult, wait_ticks: u64) i32 {
-    acquireTcpServiceLock(app);
-    defer releaseTcpServiceLock();
+fn tcpCloseServiceResultWait(app: *const App, conn_id: u32, result: *r4os.abi.NetServiceTcpResult, wait_ticks: u64) i32 {
     return app.net.tcpCloseServiceResultWait(conn_id, result, wait_ticks);
 }
 
-fn tcpAbortServiceResultWaitLocked(app: *const App, conn_id: u32, result: *r4os.abi.NetServiceTcpResult, wait_ticks: u64) i32 {
-    acquireTcpServiceLock(app);
-    defer releaseTcpServiceLock();
+fn tcpAbortServiceResultWait(app: *const App, conn_id: u32, result: *r4os.abi.NetServiceTcpResult, wait_ticks: u64) i32 {
     return app.net.tcpAbortServiceResultWait(conn_id, result, wait_ticks);
 }
 
-fn tcpAbortServiceWaitLocked(app: *const App, conn_id: u32, wait_ticks: u64) i32 {
-    acquireTcpServiceLock(app);
-    defer releaseTcpServiceLock();
+fn tcpAbortServiceWait(app: *const App, conn_id: u32, wait_ticks: u64) i32 {
     return app.net.tcpAbortServiceWait(conn_id, wait_ticks);
 }
 
-fn tcpRetransmitServiceResultWaitLocked(app: *const App, conn_id: u32, result: *r4os.abi.NetServiceTcpResult, wait_ticks: u64) i32 {
-    acquireTcpServiceLock(app);
-    defer releaseTcpServiceLock();
+fn tcpRetransmitServiceResultWait(app: *const App, conn_id: u32, result: *r4os.abi.NetServiceTcpResult, wait_ticks: u64) i32 {
     return app.net.tcpRetransmitServiceResultWait(conn_id, result, wait_ticks);
 }
 
-fn tcpPollServiceWaitLocked(app: *const App, conn_id: u32, out: *r4os.abi.NetServiceTcpResult, wait_ticks: u64) i32 {
-    acquireTcpServiceLock(app);
-    defer releaseTcpServiceLock();
+fn tcpPollServiceWait(app: *const App, conn_id: u32, out: *r4os.abi.NetServiceTcpResult, wait_ticks: u64) i32 {
     return app.net.tcpPollServiceWait(conn_id, out, wait_ticks);
 }
 
-fn tcpReadWaitServiceConsumeSafeLocked(app: *const App, conn_id: u32, out: []u8, wait_ticks: u64, service_wait_ticks: u64) i32 {
-    acquireTcpServiceLock(app);
-    defer releaseTcpServiceLock();
+fn tcpReadWaitServiceConsumeSafe(app: *const App, conn_id: u32, out: []u8, wait_ticks: u64, service_wait_ticks: u64) i32 {
     // 0.57.8: Consume-sicher (0.56.39-Klasse, wie FTPSVC): der Poll bleibt
     // auf dem Service-Budget (idempotent, Retry gefahrlos), aber der
     // daten-konsumierende Read darf NIE per Service-Timeout verfallen -
@@ -1807,18 +1763,16 @@ fn tcpReadWaitServiceConsumeSafeLocked(app: *const App, conn_id: u32, out: []u8,
     return app.net.tcpReadWaitServiceConsumeSafe(conn_id, out, wait_ticks, tcpServiceCallWaitTicks(app, service_wait_ticks));
 }
 
-fn tcpWriteChunkServiceWaitLocked(app: *const App, conn_id: u32, data: []const u8, wait_ticks: u64) i32 {
-    acquireTcpServiceLock(app);
-    defer releaseTcpServiceLock();
+fn tcpWriteChunkServiceWait(app: *const App, conn_id: u32, data: []const u8, wait_ticks: u64) i32 {
     return app.net.tcpWriteChunkServiceWait(conn_id, data, tcpServiceCallWaitTicks(app, wait_ticks));
 }
 
 fn closeTcpSession(app: *const App, conn_id: u32) void {
     if (conn_id == 0) return;
     var result: r4os.abi.NetServiceTcpResult = .{};
-    const rc = tcpCloseServiceResultWaitLocked(app, conn_id, &result, tcpServiceCleanupWaitTicks(app));
+    const rc = tcpCloseServiceResultWait(app, conn_id, &result, tcpServiceCleanupWaitTicks(app));
     if (rc != 0 or result.result != r4os.abi.tcp_result_ok) {
-        _ = tcpAbortServiceWaitLocked(app, conn_id, tcpServiceCleanupWaitTicks(app));
+        _ = tcpAbortServiceWait(app, conn_id, tcpServiceCleanupWaitTicks(app));
     }
 }
 
@@ -1891,6 +1845,47 @@ fn sendSshBanner(app: *const App, conn_id: u32, stats: *ServiceStats) bool {
     stats.last_tcp_result = wrote;
     setLastProtocolError(stats, "banner-write");
     return false;
+}
+
+const KeyExchangeError = error{
+    PublicKey,
+    SharedKey,
+    ZeroSharedKey,
+    SigningKey,
+    PublicKeyMismatch,
+    HostKeyBlob,
+    Signature,
+    VerifySignature,
+    ReplyPayload,
+};
+const KeyExchange = struct {
+    shared: [32]u8,
+    hash: [32]u8,
+    reply: [256]u8,
+    reply_len: usize,
+};
+
+// The result is owned by the session. No send, disconnect or service wait
+// may occur while this computation lock is held.
+fn prepareKeyExchange(app: *const App, host_key: *const HostKey, eph_seed: [32]u8, client_ident: []const u8, client_kex: []const u8, server_kex: []const u8, client_pub: []const u8, out: *KeyExchange) KeyExchangeError!void {
+    acquireKexCryptoLock(app);
+    defer releaseKexCryptoLock();
+    var basepoint: [32]u8 = .{0} ** 32;
+    basepoint[0] = 9;
+    const eph_public = X25519.scalarmult(eph_seed, basepoint) catch return error.PublicKey;
+    out.shared = X25519.scalarmult(eph_seed, client_pub[0..32].*) catch return error.SharedKey;
+    if (allZero(out.shared[0..])) return error.ZeroSharedKey;
+    const signing_key = Ed25519.KeyPair.generateDeterministic(host_key.seed) catch return error.SigningKey;
+    const signing_public = signing_key.public_key.toBytes();
+    if (!bytesEq(signing_public[0..], host_key.public_key[0..])) return error.PublicKeyMismatch;
+    var host_blob_buf: [64]u8 = .{0} ** 64;
+    const host_blob = buildHostKeyBlobFromPublic(signing_public[0..], host_blob_buf[0..]) orelse return error.HostKeyBlob;
+    computeExchangeHash(&out.hash, client_ident, ssh_ident, client_kex, server_kex, host_blob, client_pub, eph_public[0..], out.shared[0..]);
+    const signature = Ed25519.KeyPair.sign(signing_key, out.hash[0..], null) catch return error.Signature;
+    signature.verify(out.hash[0..], signing_key.public_key) catch return error.VerifySignature;
+    const signature_bytes = signature.toBytes();
+    const reply = buildKexReply(out.reply[0..], host_blob, eph_public[0..], signature_bytes[0..]) orelse return error.ReplyPayload;
+    out.reply_len = reply.len;
 }
 
 fn handleSshTransport(app: *const App, conn_id: u32, endpoint_handle: u32, stats: *ServiceStats, config: *const Config, host_key: *const HostKey, buffers: *SessionBuffers, session_slot: ?*SessionWorkerSlot) i32 {
@@ -1984,72 +1979,34 @@ fn handleSshTransport(app: *const App, conn_id: u32, endpoint_handle: u32, stats
 
         var eph_seed: [32]u8 = undefined;
         rng.fill(eph_seed[0..]);
-        var x25519_basepoint: [32]u8 = .{0} ** 32;
-        x25519_basepoint[0] = 9;
-
-        var eph_public: [32]u8 = undefined;
-        var shared: [32]u8 = undefined;
-        var exchange_hash: [32]u8 = undefined;
-        var reply_payload_buf: [256]u8 = .{0} ** 256;
-        {
-            acquireKexCryptoLock(app);
-            defer releaseKexCryptoLock();
-            eph_public = X25519.scalarmult(eph_seed, x25519_basepoint) catch {
-                stats.crypto_errors +%= 1;
-                setLastProtocolError(stats, "x25519-public");
-                return -1;
-            };
-            shared = X25519.scalarmult(eph_seed, client_pub[0..32].*) catch {
-                _ = sendPlainDisconnect(app, conn_id, ssh_disconnect_key_exchange_failed, "Curve25519 failed", buffers, &rng, &seq_out);
-                stats.crypto_errors +%= 1;
-                setLastProtocolError(stats, "x25519-shared");
-                return -1;
-            };
-            if (allZero(shared[0..])) {
-                _ = sendPlainDisconnect(app, conn_id, ssh_disconnect_key_exchange_failed, "Curve25519 shared secret rejected", buffers, &rng, &seq_out);
-                stats.crypto_errors +%= 1;
-                setLastProtocolError(stats, "x25519-zero");
-                return -1;
+        var exchange: KeyExchange = undefined;
+        prepareKeyExchange(app, host_key, eph_seed, client_ident, client_kex_payload, server_kex_payload, client_pub, &exchange) catch |err| {
+            switch (err) {
+                error.HostKeyBlob, error.ReplyPayload => stats.protocol_errors +%= 1,
+                else => stats.crypto_errors +%= 1,
             }
-            const signing_key = Ed25519.KeyPair.generateDeterministic(host_key.seed) catch {
-                stats.crypto_errors +%= 1;
-                setLastProtocolError(stats, "hostkey-sign-key");
-                return -1;
-            };
-            const signing_public = signing_key.public_key.toBytes();
-            if (!bytesEq(signing_public[0..], host_key.public_key[0..])) {
-                stats.crypto_errors +%= 1;
-                setLastProtocolError(stats, "hostkey-public-mismatch");
-                return -1;
+            setLastProtocolError(stats, switch (err) {
+                error.PublicKey => "x25519-public",
+                error.SharedKey => "x25519-shared",
+                error.ZeroSharedKey => "x25519-zero",
+                error.SigningKey => "hostkey-sign-key",
+                error.PublicKeyMismatch => "hostkey-public-mismatch",
+                error.HostKeyBlob => "hostkey-blob",
+                error.Signature => "hostkey-sign",
+                error.VerifySignature => "hostkey-sign-verify",
+                error.ReplyPayload => "kex-reply",
+            });
+            // The preparation helper has released its computation lock on
+            // every outcome, including these protocol error replies.
+            if (err == error.SharedKey or err == error.ZeroSharedKey) {
+                _ = sendPlainDisconnect(app, conn_id, ssh_disconnect_key_exchange_failed, if (err == error.SharedKey) "Curve25519 failed" else "Curve25519 shared secret rejected", buffers, &rng, &seq_out);
             }
-            var host_blob_buf: [64]u8 = .{0} ** 64;
-            const host_blob = buildHostKeyBlobFromPublic(signing_public[0..], host_blob_buf[0..]) orelse {
-                stats.protocol_errors +%= 1;
-                setLastProtocolError(stats, "hostkey-blob");
-                return -1;
-            };
-            computeExchangeHash(&exchange_hash, client_ident, ssh_ident, client_kex_payload, server_kex_payload, host_blob, client_pub, eph_public[0..], shared[0..]);
-            const signature = Ed25519.KeyPair.sign(signing_key, exchange_hash[0..], null) catch {
-                stats.crypto_errors +%= 1;
-                setLastProtocolError(stats, "hostkey-sign");
-                return -1;
-            };
-            signature.verify(exchange_hash[0..], signing_key.public_key) catch {
-                stats.crypto_errors +%= 1;
-                setLastProtocolError(stats, "hostkey-sign-verify");
-                return -1;
-            };
-            const signature_bytes = signature.toBytes();
-            const reply_payload = buildKexReply(reply_payload_buf[0..], host_blob, eph_public[0..], signature_bytes[0..]) orelse {
-                stats.protocol_errors +%= 1;
-                setLastProtocolError(stats, "kex-reply");
-                return -1;
-            };
-            if (!sendPlainPacket(app, conn_id, reply_payload, buffers, &rng, &seq_out, stats)) {
-                stats.protocol_errors +%= 1;
-                setLastProtocolError(stats, "send-kex-reply");
-                return -1;
-            }
+            return -1;
+        };
+        if (!sendPlainPacket(app, conn_id, exchange.reply[0..exchange.reply_len], buffers, &rng, &seq_out, stats)) {
+            stats.protocol_errors +%= 1;
+            setLastProtocolError(stats, "send-kex-reply");
+            return -1;
         }
         var client_newkeys_buf: [64]u8 = .{0} ** 64;
         const client_newkeys = readPlainPacket(app, conn_id, client_newkeys_buf[0..], buffers, timeout, &seq_in, stats) orelse {
@@ -2072,7 +2029,7 @@ fn handleSshTransport(app: *const App, conn_id: u32, endpoint_handle: u32, stats
         }
 
         acquireSshCryptoLock(app);
-        deriveTransportKeys(&keys, shared[0..], exchange_hash[0..]);
+        deriveTransportKeys(&keys, exchange.shared[0..], exchange.hash[0..]);
         releaseSshCryptoLock();
         stats.newkeys +%= 1;
         app.sys.println("SSHD NEWKEYS complete");
@@ -5521,7 +5478,7 @@ fn pollEncryptedPacket(app: *const App, conn_id: u32) EncryptedPacketPoll {
 }
 
 fn tcpPollServiceResultWaitRaw(app: *const App, conn_id: u32, out: *r4os.abi.NetServiceTcpResult, wait_ticks: u64) i32 {
-    const rc = tcpPollServiceWaitLocked(app, conn_id, out, wait_ticks);
+    const rc = tcpPollServiceWait(app, conn_id, out, wait_ticks);
     // The SDK also returns -1 for a successfully received terminal socket
     // result. Preserve that structured result for every caller's lifecycle
     // check instead of classifying a dead peer as transient service failure.
@@ -5906,7 +5863,7 @@ fn readClientIdent(app: *const App, conn_id: u32, out: []u8, buffers: *SessionBu
     const start = app.sys.ticks();
     while (app.sys.ticks() - start < timeout_ticks and pos + 1 < out.len) {
         var read_buf: [ssh_ident_read_chunk_max]u8 = .{0} ** ssh_ident_read_chunk_max;
-        const got = tcpReadWaitServiceConsumeSafeLocked(app, conn_id, read_buf[0..], app.sys.ticksFromMilliseconds(50), tcpFastServiceWaitTicks(app));
+        const got = tcpReadWaitServiceConsumeSafe(app, conn_id, read_buf[0..], app.sys.ticksFromMilliseconds(50), tcpFastServiceWaitTicks(app));
         if (got < 0) {
             if (tcpReadTransientRecoverable(app, conn_id, tcpFastServiceWaitTicks(app), stats)) {
                 setPacketReadDiag(stats, "ident-retry", 1, 0);
@@ -6031,7 +5988,7 @@ fn flushTcpControlWrite(app: *const App, conn_id: u32, stats: ?*ServiceStats) bo
         const now = app.sys.ticks();
         if (retransmit_ticks != 0 and now - last_retransmit >= retransmit_ticks) {
             var retry: r4os.abi.NetServiceTcpResult = .{};
-            const retry_rc = tcpRetransmitServiceResultWaitLocked(app, conn_id, &retry, tcpServiceWaitTicks(app));
+            const retry_rc = tcpRetransmitServiceResultWait(app, conn_id, &retry, tcpServiceWaitTicks(app));
             if (retry_rc != 0) {
                 noteTcpTransient(stats, null, retry_rc, .write);
             } else {
@@ -6050,7 +6007,7 @@ fn maybeRetransmitTcpControl(app: *const App, conn_id: u32, stats: ?*ServiceStat
     const now = app.sys.ticks();
     if (now - last_retransmit.* < retransmit_ticks) return;
     var retry: r4os.abi.NetServiceTcpResult = .{};
-    const retry_rc = tcpRetransmitServiceResultWaitLocked(app, conn_id, &retry, tcpServiceWaitTicks(app));
+    const retry_rc = tcpRetransmitServiceResultWait(app, conn_id, &retry, tcpServiceWaitTicks(app));
     if (retry_rc != 0) {
         noteTcpTransient(stats, null, retry_rc, .write);
     } else {
@@ -6170,7 +6127,7 @@ fn readExactTrackedFromOffset(app: *const App, conn_id: u32, out: []u8, initial_
         if (now - last_progress >= timeout_ticks) break;
         if (now - start >= total_timeout_ticks) break;
         if (!pumpChannelDuringRead(app, conn_id, pump)) return false;
-        const got = tcpReadWaitServiceConsumeSafeLocked(app, conn_id, out[offset..], app.sys.ticksFromMilliseconds(50), service_wait_ticks);
+        const got = tcpReadWaitServiceConsumeSafe(app, conn_id, out[offset..], app.sys.ticksFromMilliseconds(50), service_wait_ticks);
         if (got < 0) {
             error_attempts += 1;
             if (first_error_tick == 0) first_error_tick = app.sys.ticks();
@@ -6271,7 +6228,7 @@ fn tcpWritePacedServiceRobust(app: *const App, conn_id: u32, data: []const u8, w
         }
 
         const chunk_len = @min(@min(data.len - offset, r4os.abi.net_service_tcp_write_max), tx_remaining);
-        const written = tcpWriteChunkServiceWaitLocked(app, conn_id, data[offset .. offset + chunk_len], service_wait_ticks);
+        const written = tcpWriteChunkServiceWait(app, conn_id, data[offset .. offset + chunk_len], service_wait_ticks);
         if (written <= 0) {
             if (expected_seq) |expected| {
                 var poll: r4os.abi.NetServiceTcpResult = .{};
