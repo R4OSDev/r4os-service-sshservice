@@ -173,6 +173,9 @@ const transfer_max_file_size: u64 = 0xFFFF_FFFF;
 
 const registry_host_key_seed = "HostKeySeed";
 const registry_host_key_public = "HostKeyPublic";
+const registry_host_key_rng_version = "HostKeyRngVersion";
+const registry_host_key_previous_public = "PreviousHostKeyPublic";
+const host_key_rng_version = [_]u8{ 1, 0, 0, 0 };
 
 const ssh_msg_disconnect: u8 = 1;
 const ssh_msg_service_request: u8 = 5;
@@ -582,46 +585,21 @@ const KexSelection = struct {
 };
 
 const SessionRng = struct {
-    state: [32]u8,
-    counter: u64 = 0,
+    engine: std.Random.DefaultCsprng,
 
-    fn init(app: *const App, host_seed: [32]u8, conn_id: u32, session_index: u32) SessionRng {
-        var h = Sha256.init(.{});
-        h.update("R4OS SSHD 0.52.8 session rng");
-        h.update(&host_seed);
-        hashU64(&h, app.sys.ticks());
-        const time_state = app.sys.timeState();
-        hashU64(&h, time_state.monotonic_ticks);
-        hashU32(&h, time_state.seconds_since_midnight);
-        hashU32(&h, conn_id);
-        hashU32(&h, session_index);
-        var seed: [32]u8 = undefined;
-        h.final(&seed);
-        if (allZero(seed[0..])) seed[0] = 1;
-        return .{ .state = seed };
+    fn init() ?SessionRng {
+        var seed: [std.Random.DefaultCsprng.secret_seed_length]u8 = undefined;
+        defer std.crypto.secureZero(u8, &seed);
+        if (!r4os.secure_random.fill(&seed)) return null;
+        return .{ .engine = std.Random.DefaultCsprng.init(seed) };
     }
 
-    fn fill(self: *SessionRng, out: []u8) void {
-        var offset: usize = 0;
-        while (offset < out.len) {
-            var h = Sha256.init(.{});
-            h.update("R4OS SSHD rng block");
-            h.update(&self.state);
-            hashU64(&h, self.counter);
-            var block: [32]u8 = undefined;
-            h.final(&block);
-            const n = @min(block.len, out.len - offset);
-            @memcpy(out[offset .. offset + n], block[0..n]);
-            offset += n;
+    fn fill(self: *SessionRng, out_bytes: []u8) void {
+        self.engine.fill(out_bytes);
+    }
 
-            var h2 = Sha256.init(.{});
-            h2.update("R4OS SSHD rng reseed");
-            h2.update(&self.state);
-            h2.update(&block);
-            hashU64(&h2, self.counter);
-            h2.final(&self.state);
-            self.counter +%= 1;
-        }
+    fn deinit(self: *SessionRng) void {
+        std.crypto.secureZero(u8, std.mem.asBytes(self));
     }
 };
 
@@ -1889,7 +1867,13 @@ fn prepareKeyExchange(app: *const App, host_key: *const HostKey, eph_seed: [32]u
 }
 
 fn handleSshTransport(app: *const App, conn_id: u32, endpoint_handle: u32, stats: *ServiceStats, config: *const Config, host_key: *const HostKey, buffers: *SessionBuffers, session_slot: ?*SessionWorkerSlot) i32 {
-    var rng = SessionRng.init(app, host_key.seed, conn_id, stats.accepted);
+    var rng = SessionRng.init() orelse {
+        stats.crypto_errors +%= 1;
+        setLastProtocolError(stats, "session-entropy-unavailable");
+        app.sys.println("SSHD session entropy unavailable");
+        return -1;
+    };
+    defer rng.deinit();
     const timeout = app.sys.ticksFromMilliseconds(session_timeout_ms);
 
     const banner_already_sent = if (session_slot) |slot| slot.banner_sent else false;
@@ -1978,6 +1962,7 @@ fn handleSshTransport(app: *const App, conn_id: u32, endpoint_handle: u32, stats
         }
 
         var eph_seed: [32]u8 = undefined;
+        defer std.crypto.secureZero(u8, &eph_seed);
         rng.fill(eph_seed[0..]);
         var exchange: KeyExchange = undefined;
         prepareKeyExchange(app, host_key, eph_seed, client_ident, client_kex_payload, server_kex_payload, client_pub, &exchange) catch |err| {
@@ -6885,60 +6870,92 @@ fn ensureRegistryDefaults(app: *const App) u32 {
 }
 
 fn loadOrCreateHostKey(app: *const App, stats: *ServiceStats) ?HostKey {
-    if (!app.sys.hasFn("registry_get_value") or !app.sys.hasFn("registry_set_value")) {
+    if (!app.sys.hasFn("registry_get_value")) {
         setLastProtocolError(stats, "registry-missing");
         return null;
     }
-
     var seed: [32]u8 = .{0} ** 32;
+    defer std.crypto.secureZero(u8, &seed);
     var public_key: [32]u8 = .{0} ** 32;
-    const seed_state = readRegistryBinaryExact(app, registry_host_key_seed, seed[0..]);
-    const public_state = readRegistryBinaryExact(app, registry_host_key_public, public_key[0..]);
-
-    if (seed_state == .missing and public_state == .missing) {
-        seed = generateHostKeySeed(app);
-        const kp = Ed25519.KeyPair.generateDeterministic(seed) catch {
-            stats.crypto_errors +%= 1;
-            setLastProtocolError(stats, "hostkey-generate");
-            return null;
-        };
-        public_key = kp.public_key.toBytes();
-        if (app.sys.registrySetBinary(registry_key, registry_host_key_seed, seed[0..]) != r4os.abi.registry_api_result_ok or
-            app.sys.registrySetBinary(registry_key, registry_host_key_public, public_key[0..]) != r4os.abi.registry_api_result_ok)
-        {
-            stats.crypto_errors +%= 1;
-            setLastProtocolError(stats, "hostkey-store");
-            app.sys.println("SSHD host key store failed");
-            return null;
-        }
-        stats.host_key_generated +%= 1;
-        app.sys.println("SSHD host key generated: ed25519");
-        return .{ .seed = seed, .public_key = public_key, .key_pair = kp };
-    }
-
+    var rng_version: [4]u8 = .{0} ** 4;
+    const seed_state = readRegistryBinaryExact(app, registry_host_key_seed, &seed);
+    const public_state = readRegistryBinaryExact(app, registry_host_key_public, &public_key);
+    const version_state = readRegistryBinaryExact(app, registry_host_key_rng_version, &rng_version);
+    if (seed_state == .missing and public_state == .missing and version_state == .missing)
+        return createRandomHostKey(app, stats, null);
     if (seed_state != .ok or public_state != .ok) {
         stats.crypto_errors +%= 1;
         setLastProtocolError(stats, "hostkey-invalid");
         app.sys.println("SSHD host key invalid in Registry");
         return null;
     }
-
     const kp = Ed25519.KeyPair.generateDeterministic(seed) catch {
         stats.crypto_errors +%= 1;
         setLastProtocolError(stats, "hostkey-seed");
         return null;
     };
     const expected = kp.public_key.toBytes();
-    if (!bytesEq(expected[0..], public_key[0..])) {
+    if (!bytesEq(&expected, &public_key)) {
         stats.crypto_errors +%= 1;
         setLastProtocolError(stats, "hostkey-mismatch");
         app.sys.println("SSHD host key mismatch in Registry");
         return null;
     }
-
+    // Unmarked keys were generated from clocks and machine identifiers.
+    // Rotate only a complete, internally consistent legacy pair; keep its
+    // public identity for traceability, never its old private seed.
+    if (version_state == .missing) return createRandomHostKey(app, stats, &public_key);
+    if (version_state != .ok or !bytesEq(&rng_version, &host_key_rng_version)) {
+        stats.crypto_errors +%= 1;
+        setLastProtocolError(stats, "hostkey-source-invalid");
+        return null;
+    }
     stats.host_key_loaded +%= 1;
     app.sys.println("SSHD host key loaded: ed25519");
     return .{ .seed = seed, .public_key = public_key, .key_pair = kp };
+}
+
+fn createRandomHostKey(app: *const App, stats: *ServiceStats, previous_public: ?[]const u8) ?HostKey {
+    var seed = generateHostKeySeed() orelse {
+        stats.crypto_errors +%= 1;
+        setLastProtocolError(stats, "hostkey-entropy-unavailable");
+        app.sys.println("SSHD host key entropy unavailable; existing identity retained");
+        return null;
+    };
+    defer std.crypto.secureZero(u8, &seed);
+    const kp = Ed25519.KeyPair.generateDeterministic(seed) catch {
+        stats.crypto_errors +%= 1;
+        setLastProtocolError(stats, "hostkey-generate");
+        return null;
+    };
+    const public_key = kp.public_key.toBytes();
+    if (!storeRandomHostKey(app, &seed, &public_key, previous_public)) {
+        stats.crypto_errors +%= 1;
+        setLastProtocolError(stats, "hostkey-store");
+        app.sys.println("SSHD host key batch store failed");
+        return null;
+    }
+    stats.host_key_generated +%= 1;
+    app.sys.println(if (previous_public != null)
+        "SSHD legacy host key replaced: clients must confirm the changed public identity"
+    else
+        "SSHD host key generated: ed25519");
+    return .{ .seed = seed, .public_key = public_key, .key_pair = kp };
+}
+
+fn storeRandomHostKey(app: *const App, seed: []const u8, public_key: []const u8, previous_public: ?[]const u8) bool {
+    const registry = r4os.Registry{ .sys = app.sys };
+    if (!registry.batchAvailable()) return false;
+    const key = r4os.RegistryPath.parse(registry_key) catch return false;
+    var operations: [4]r4os.abi.RegistryBatchOperation = undefined;
+    var blob: [1024]u8 = undefined;
+    defer std.crypto.secureZero(u8, &blob);
+    var batch = r4os.RegistryBatchBuilder.init(&operations, &blob);
+    batch.setBinary(&key, registry_host_key_seed, seed) catch return false;
+    batch.setBinary(&key, registry_host_key_public, public_key) catch return false;
+    batch.setBinary(&key, registry_host_key_rng_version, &host_key_rng_version) catch return false;
+    if (previous_public) |previous| batch.setBinary(&key, registry_host_key_previous_public, previous) catch return false;
+    return registry.applyBatch(&batch).committed();
 }
 
 const RegistryBinaryState = enum {
@@ -6951,36 +6968,20 @@ fn readRegistryBinaryExact(app: *const App, name: [*:0]const u8, out: []u8) Regi
     var info: r4os.abi.RegistryValueInfo = .{};
     var data: [96]u8 = .{0} ** 96;
     const rc = app.sys.registryGetValue(registry_key, name, &info, data[0..]);
-    if (rc < 0) return .missing;
+    if (rc == r4os.abi.registry_api_result_value_not_found or
+        rc == r4os.abi.registry_api_result_key_not_found or
+        rc == r4os.abi.registry_api_result_hive_not_found) return .missing;
+    if (rc < 0) return .invalid;
     if (info.value_type != r4os.abi.registry_value_type_binary) return .invalid;
     if (info.data_len != out.len or rc != @as(i32, @intCast(out.len))) return .invalid;
     @memcpy(out, data[0..out.len]);
     return .ok;
 }
 
-fn generateHostKeySeed(app: *const App) [32]u8 {
-    var h = Sha256.init(.{});
-    h.update("R4OS SSHD 0.52.8 ed25519 host key");
-    hashU64(&h, app.sys.ticks());
-    const time_state = app.sys.timeState();
-    hashU64(&h, time_state.monotonic_ticks);
-    hashU32(&h, time_state.seconds_since_midnight);
-    hashU32(&h, @intCast(time_state.year));
-    hashU32(&h, time_state.month);
-    hashU32(&h, time_state.day);
-    hashU32(&h, time_state.hour);
-    hashU32(&h, time_state.minute);
-    hashU32(&h, time_state.second);
-    var net_config: r4os.abi.NetConfigSnapshot = .{};
-    if (app.net.netConfigGet(&net_config) == 0) {
-        h.update(&net_config.mac);
-        h.update(&net_config.local_ip);
-        h.update(&net_config.gateway_ip);
-    }
-    var out: [32]u8 = undefined;
-    h.final(&out);
-    if (allZero(out[0..])) out[0] = 1;
-    return out;
+fn generateHostKeySeed() ?[32]u8 {
+    var seed: [32]u8 = undefined;
+    if (!r4os.secure_random.fill(&seed)) return null;
+    return seed;
 }
 
 fn ensureString(app: *const App, name: [*:0]const u8, value: []const u8) u32 {
