@@ -3,6 +3,15 @@
 
 SSHD.R4X ist der SSH-Serverdienst fuer R4OS.
 
+0.82.10 / SSHD 0.1.10: Beim Programmende muss die letzte stabile
+Konsolenrevision bereits in der SSH-Ausgabequeue angekommen sein. Endet ein
+Programm zwischen Ausgabe- und Statusabfrage, liest die naechste normale
+Iteration seine Schlusszeilen, bevor exit-status, EOF und Close folgen.
+Eine volle Queue, eine instabile Abfrage oder noch fehlender Snapshot gilt
+nicht als abgeschlossene Ausgabe. Der bestehende Hosttest ruft den echten
+Ausgabepump mit diesem Ablauf, Rueckstau, Revisionswechsel und leerer Ausgabe
+auf; ein unveraenderter Fehler-Exit bleibt dabei erhalten.
+
 Seit 0.60.20 beantwortet SSHD `R4DIAG PING` und `R4DIAG TASKS` direkt im
 Session-Worker. Dieser Diagnosepfad startet weder `TERMINAL.R4X` noch ein
 anderes Programm und fuehrt kein Dateisystem-I/O aus. `TASKS` liefert den

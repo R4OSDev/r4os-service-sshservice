@@ -4,13 +4,18 @@
 
 ## Package
 
-- Version: `0.1.9`
+- Version: `0.1.10`
 - Image target: `/R4OS/SERVICES/SSHD.R4X`
 - Image scope: `full`
 - Canonical project manifest: `module.R4MF`
 
 The manifest is the single source of truth for the artifact, imports, image
 target, and package metadata.
+
+When a console program exits, SSHD queues its final stable console revision
+before sending exit status, EOF and close. Program completion between the
+output and status queries can no longer discard the final lines. Backpressure
+and unstable snapshots retain the channel for the next normal pump.
 
 ## Build
 

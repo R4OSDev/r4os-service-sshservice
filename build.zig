@@ -11,12 +11,13 @@ pub fn build(b: *std.Build) void {
     const sdk = sdk_build.sdk(b, sdk_dep, .{});
     _ = sdk.addR4MF(b.path("module.R4MF"));
 
-    const test_step = b.step("test", "Run SSH channel flow-control unit tests");
+    const test_step = b.step("test", "Run SSH channel flow-control and console completion tests");
     const tests = b.addTest(.{
         .root_module = b.createModule(.{
-            .root_source_file = b.path("src/channel_flow.zig"),
+            .root_source_file = b.path("src/main.zig"),
             .target = b.graph.host,
             .optimize = .ReleaseSafe,
+            .imports = &.{.{ .name = "r4os", .module = sdk.createR4osModule(b.graph.host, .ReleaseSafe) }},
         }),
     });
     const run_tests = b.addRunArtifact(tests);
