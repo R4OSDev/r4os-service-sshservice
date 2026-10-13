@@ -458,7 +458,6 @@ const SessionBuffers = struct {
     // and retires an r4x-async-io task and therefore changes the task epoch.
     // Keep the complete bounded snapshot in session-owned heap scratch so
     // concurrent SSH sessions neither share storage nor grow their stacks.
-    direct_task_inventory: [@as(usize, direct_diag_task_limit)]r4os.abi.ProgramTaskSnapshot = undefined,
 };
 
 const AuthAttempt = struct {
@@ -2743,7 +2742,7 @@ fn handleChannelRequest(app: *const App, conn_id: u32, stats: *ServiceStats, con
             if (want_reply and !sendChannelRequestReply(app, conn_id, key, buffers, rng, seq_out, channel.client_channel, true)) {
                 return .protocol_error;
             }
-            return runDirectDiagnostic(app, conn_id, stats, key, channel, buffers, rng, seq_out, command);
+            return runDirectDiagnostic(app, stats, channel, buffers, command);
         }
         if (isScpCommand(command)) {
             if (!startScpExec(app, stats, config, channel, buffers, command)) {
@@ -2877,265 +2876,29 @@ fn isDirectDiagnosticCommand(command: []const u8) bool {
     const first = tokenizer.next() orelse return false;
     if (!equalsIgnoreCase(first, "R4DIAG")) return false;
     const subcommand = tokenizer.next() orelse return true;
-    return equalsIgnoreCase(subcommand, "TASKS") or equalsIgnoreCase(subcommand, "PING");
+    return equalsIgnoreCase(subcommand, "PING") and tokenizer.next() == null;
 }
 
-fn directDiagnosticWantsTasks(command: []const u8) bool {
-    var tokenizer = CommandTokenizer.init(trimSpaces(command));
-    _ = tokenizer.next() orelse return false;
-    const subcommand = tokenizer.next() orelse return true;
-    return equalsIgnoreCase(subcommand, "TASKS");
-}
-
-const DirectTaskInventoryStatus = enum {
-    not_requested,
-    complete,
-    truncated,
-    unstable,
-    unavailable,
-};
-
-const DirectTaskInventoryResult = struct {
-    status: DirectTaskInventoryStatus = .not_requested,
-    count: usize = 0,
-    restarts: u32 = 0,
-    summary_valid: bool = false,
-};
-
+// Transport health belongs to SSHD. Kernel inventories are queried only by
+// SPECTRA METRICS TASKS/LIFECYCLE, including generation and owner identities.
 fn runDirectDiagnostic(
     app: *const App,
-    conn_id: u32,
     stats: *ServiceStats,
-    key: []const u8,
     channel: *ChannelState,
     buffers: *SessionBuffers,
-    rng: *SessionRng,
-    seq_out: *u32,
     command: []const u8,
 ) ChannelAction {
-    var output: [768]u8 = undefined;
-    var pos: usize = 0;
-    appendText(output[0..], &pos, "R4DIAG result: ");
-    var cursor: r4os.abi.ProgramInventoryCursor = .{};
-    var summary: r4os.abi.ProgramInventorySummary = .{};
-    const wants_tasks = directDiagnosticWantsTasks(command);
-    var task_inventory: DirectTaskInventoryResult = .{};
-    const inventory_ok = if (wants_tasks) inventory: {
-        task_inventory = collectDirectTaskInventory(
-            app,
-            &cursor,
-            &summary,
-            buffers.direct_task_inventory[0..],
-        );
-        break :inventory task_inventory.summary_valid;
-    } else beginProgramInventory(app, &cursor, &summary);
-    appendText(output[0..], &pos, if (inventory_ok) "OK" else "FAILED");
-    appendText(output[0..], &pos, " source=sshd-direct spawn=no fs=no ticks=");
-    appendU64(output[0..], &pos, app.sys.ticks());
-    if (inventory_ok) {
-        appendText(output[0..], &pos, " programs=");
-        appendU64(output[0..], &pos, summary.program_total);
-        appendText(output[0..], &pos, " active=");
-        appendU64(output[0..], &pos, summary.program_active);
-        appendText(output[0..], &pos, " done=");
-        appendU64(output[0..], &pos, summary.program_done);
-        appendText(output[0..], &pos, " tasks=");
-        appendU64(output[0..], &pos, summary.task_total);
-        appendText(output[0..], &pos, " running=");
-        appendU64(output[0..], &pos, summary.task_running);
-        appendText(output[0..], &pos, " ready=");
-        appendU64(output[0..], &pos, summary.task_ready);
-        appendText(output[0..], &pos, " blocked=");
-        appendU64(output[0..], &pos, summary.task_blocked);
-        appendText(output[0..], &pos, " threads=");
-        appendU64(output[0..], &pos, summary.thread_total);
-        appendText(output[0..], &pos, " heap_blocks=");
-        appendU64(output[0..], &pos, summary.heap_active_blocks);
-        appendText(output[0..], &pos, " heap_bytes=");
-        appendU64(output[0..], &pos, summary.heap_used_bytes);
-    } else {
-        appendText(output[0..], &pos, " reason=inventory-unavailable");
-    }
-    appendText(output[0..], &pos, "\r\n");
-
     channel.exec_started = true;
     channel.last_activity_tick = app.sys.ticks();
     noteSessionKind(stats, "diag-direct", command);
     stats.exec_sessions +%= 1;
-    var sent = queueChannelData(stats, buffers, output[0..pos]);
-    if (sent and inventory_ok and wants_tasks) {
-        sent = sendDirectTaskInventory(
-            app,
-            conn_id,
-            stats,
-            key,
-            channel,
-            buffers,
-            rng,
-            seq_out,
-            buffers.direct_task_inventory[0..task_inventory.count],
-            task_inventory,
-        );
-    }
-    const exit_code: i32 = if (inventory_ok and sent) 0 else 1;
+    const sent = queueChannelData(stats, buffers, "R4DIAG result: OK source=sshd-direct spawn=no fs=no\r\n");
+    const exit_code: i32 = if (sent) 0 else 1;
     channel.last_exit_code = exit_code;
     noteChannelExit(stats, exit_code);
     noteCloseReason(stats, "diag-direct");
     scheduleChannelClose(channel, sshExitStatus(exit_code));
     return .continue_session;
-}
-
-fn collectDirectTaskInventory(
-    app: *const App,
-    cursor: *r4os.abi.ProgramInventoryCursor,
-    summary: *r4os.abi.ProgramInventorySummary,
-    entries: []r4os.abi.ProgramTaskSnapshot,
-) DirectTaskInventoryResult {
-    var attempt: u32 = 0;
-    restart: while (attempt < inventory_restart_limit) : (attempt += 1) {
-        if (!beginProgramInventory(app, cursor, summary)) {
-            return .{ .status = .unavailable };
-        }
-
-        var collected: usize = 0;
-        while (collected < entries.len) {
-            const capacity = @min(
-                @as(usize, r4os.abi.program_inventory_page_max),
-                entries.len - collected,
-            );
-            var page: r4os.abi.ProgramInventoryPageInfo = .{};
-            if (!readTaskInventoryPage(app, cursor, entries[collected .. collected + capacity], &page)) {
-                return .{
-                    .status = .unavailable,
-                    .restarts = attempt,
-                    .summary_valid = true,
-                };
-            }
-            if (page.status == r4os.abi.program_inventory_status_restart or
-                page.snapshot_generation != cursor.snapshot_generation)
-            {
-                continue :restart;
-            }
-            if (@as(usize, @intCast(page.returned)) > capacity) {
-                return .{
-                    .status = .unavailable,
-                    .restarts = attempt,
-                    .summary_valid = true,
-                };
-            }
-            collected += @intCast(page.returned);
-            if (page.status == r4os.abi.program_inventory_status_complete) {
-                return .{
-                    .status = .complete,
-                    .count = collected,
-                    .restarts = attempt,
-                    .summary_valid = true,
-                };
-            }
-            if (page.status != r4os.abi.program_inventory_status_more or page.returned == 0) {
-                return .{
-                    .status = .unavailable,
-                    .restarts = attempt,
-                    .summary_valid = true,
-                };
-            }
-        }
-        return .{
-            .status = .truncated,
-            .count = entries.len,
-            .restarts = attempt,
-            .summary_valid = true,
-        };
-    }
-    return .{
-        .status = .unstable,
-        .restarts = inventory_restart_limit,
-        .summary_valid = true,
-    };
-}
-
-fn sendDirectTaskInventory(
-    app: *const App,
-    conn_id: u32,
-    stats: *ServiceStats,
-    key: []const u8,
-    channel: *const ChannelState,
-    buffers: *SessionBuffers,
-    rng: *SessionRng,
-    seq_out: *u32,
-    entries: []const r4os.abi.ProgramTaskSnapshot,
-    result: DirectTaskInventoryResult,
-) bool {
-    if (result.restarts != 0 and result.status != .unstable) {
-        var restart_line: [64]u8 = undefined;
-        var restart_pos: usize = 0;
-        appendText(restart_line[0..], &restart_pos, "R4DIAG tasks: RESTARTS count=");
-        appendU64(restart_line[0..], &restart_pos, result.restarts);
-        appendText(restart_line[0..], &restart_pos, "\r\n");
-        if (!sendDirectDiagnosticLine(app, conn_id, stats, key, channel, buffers, rng, seq_out, restart_line[0..restart_pos])) return false;
-    }
-
-    switch (result.status) {
-        .unstable => {
-            _ = sendDirectDiagnosticLine(app, conn_id, stats, key, channel, buffers, rng, seq_out, "R4DIAG tasks: UNSTABLE\r\n");
-            return false;
-        },
-        .unavailable => {
-            _ = sendDirectDiagnosticLine(app, conn_id, stats, key, channel, buffers, rng, seq_out, "R4DIAG tasks: UNAVAILABLE\r\n");
-            return false;
-        },
-        .not_requested => return true,
-        .complete, .truncated => {},
-    }
-
-    for (entries) |entry| {
-        var line: [224]u8 = undefined;
-        var pos: usize = 0;
-        appendText(line[0..], &pos, "R4DIAG task id=");
-        appendU64(line[0..], &pos, entry.task_id);
-        appendText(line[0..], &pos, " gen=");
-        appendU64(line[0..], &pos, entry.generation);
-        appendText(line[0..], &pos, " state=");
-        appendU64(line[0..], &pos, entry.state);
-        appendText(line[0..], &pos, " owner=");
-        appendU64(line[0..], &pos, entry.owner_instance_id);
-        appendText(line[0..], &pos, " last_run=");
-        appendU64(line[0..], &pos, entry.last_run_tick);
-        appendText(line[0..], &pos, " age=");
-        appendU64(line[0..], &pos, app.sys.ticks() -| entry.last_run_tick);
-        appendText(line[0..], &pos, " wake=");
-        appendU64(line[0..], &pos, entry.wake_tick);
-        appendText(line[0..], &pos, " runtime=");
-        appendU64(line[0..], &pos, entry.runtime_ticks);
-        appendText(line[0..], &pos, " flags=");
-        appendU64(line[0..], &pos, entry.flags);
-        appendText(line[0..], &pos, "\r\n");
-        if (!sendDirectDiagnosticLine(app, conn_id, stats, key, channel, buffers, rng, seq_out, line[0..pos])) return false;
-    }
-    if (result.status == .truncated) {
-        return sendDirectDiagnosticLine(app, conn_id, stats, key, channel, buffers, rng, seq_out, "R4DIAG tasks: TRUNCATED\r\n");
-    }
-    return true;
-}
-
-fn sendDirectDiagnosticLine(
-    app: *const App,
-    conn_id: u32,
-    stats: *ServiceStats,
-    key: []const u8,
-    channel: *const ChannelState,
-    buffers: *SessionBuffers,
-    rng: *SessionRng,
-    seq_out: *u32,
-    line: []const u8,
-) bool {
-    _ = app;
-    _ = conn_id;
-    _ = key;
-    _ = channel;
-    _ = rng;
-    _ = seq_out;
-    return queueChannelData(stats, buffers, line);
 }
 
 const RemoteProgramKind = enum {
@@ -3903,6 +3666,22 @@ fn pumpConsoleOutput(app: *const App, conn_id: u32, stats: *ServiceStats, key: [
     const stream_bytes = state.stdout_bytes +% state.stderr_bytes;
     const stream_delta = stream_bytes -% channel.last_console_stream_bytes;
     const dropped_delta = state.output_dropped_bytes -% channel.last_output_dropped_bytes;
+    // The console retains a bounded tail. Once unseen bytes have fallen out
+    // of it, a successful SSH exit would certify a corrupt structured stream.
+    // Ordinary scrolling of already delivered bytes is not an overrun; an
+    // explicit console clear starts a new transcript instead.
+    if (state.clear_count == channel.last_clear_count and dropped_delta != 0 and stream_delta > got) {
+        var message: [160]u8 = undefined;
+        const diagnostic = std.fmt.bufPrint(&message, "SSHD: console output lost {d} bytes; command output incomplete.\r\n", .{stream_delta - got}) catch return false;
+        if (!queueChannelData(stats, buffers, diagnostic)) return false;
+        stats.channel_output_failures +%= 1;
+        setLastProtocolError(stats, "console-output-overrun");
+        noteCloseReason(stats, "console-output-overrun");
+        _ = app.sys.programKill(channel.shell_instance);
+        noteChannelExit(stats, 3);
+        scheduleChannelClose(channel, 3);
+        return true;
+    }
     const output_changed = state.clear_count != channel.last_clear_count or
         state.output_len != channel.last_output_len or
         stream_delta != 0 or
@@ -5538,7 +5317,6 @@ const ProgramInventoryLookup = union(enum) {
 
 const inventory_restart_limit: u32 = 16;
 const inventory_would_block_retry_limit: u32 = 64;
-const direct_diag_task_limit: u32 = 192;
 
 fn remoteProgramExitCode(app: *const App, instance_id: u32) ?i32 {
     if (instance_id == 0) return 0;
@@ -5606,27 +5384,6 @@ fn readProgramInventoryPage(
         const cursor_before = cursor.*;
         page.* = .{};
         const status = app.sys.programInventoryPrograms(cursor, entries, page);
-        if (status == r4os.abi.program_handle_ok) return true;
-        cursor.* = cursor_before;
-        page.* = .{};
-        if (status != r4os.abi.program_handle_error_would_block or retry == inventory_would_block_retry_limit)
-            return false;
-        app.sys.sleepTicks(1);
-    }
-    return false;
-}
-
-fn readTaskInventoryPage(
-    app: *const App,
-    cursor: *r4os.abi.ProgramInventoryCursor,
-    entries: []r4os.abi.ProgramTaskSnapshot,
-    page: *r4os.abi.ProgramInventoryPageInfo,
-) bool {
-    var retry: u32 = 0;
-    while (retry <= inventory_would_block_retry_limit) : (retry += 1) {
-        const cursor_before = cursor.*;
-        page.* = .{};
-        const status = app.sys.programInventoryTasks(cursor, entries, page);
         if (status == r4os.abi.program_handle_ok) return true;
         cursor.* = cursor_before;
         page.* = .{};
@@ -5778,13 +5535,17 @@ test "program exit drains the last console revision before channel close" {
         var output: []const u8 = "prefix\n";
         var revision: u32 = 1;
         var change_during_read: bool = false;
+        var stream_override: ?u32 = null;
+        var dropped: u32 = 0;
+        var killed: u32 = 0;
         fn readRevision(_: u32) callconv(.c) u32 {
             return revision;
         }
         fn readState(_: u32, state: *r4os.abi.ConsoleState) callconv(.c) i32 {
-            state.* = .{ .output_len = @intCast(output.len), .stdout_bytes = @intCast(output.len) };
+            state.* = .{ .output_len = @intCast(output.len), .stdout_bytes = stream_override orelse @intCast(output.len), .output_dropped_bytes = dropped };
             return 0;
         }
+        fn kill(id: u32) callconv(.c) i32 { killed = id; return 0; }
         fn readOutput(_: u32, bytes: [*]u8, capacity: u32) callconv(.c) i32 {
             std.debug.assert(capacity > output.len);
             @memcpy(bytes[0..output.len], output);
@@ -5799,7 +5560,7 @@ test "program exit drains the last console revision before channel close" {
         }
     };
     const raw: r4os.abi.R4XStartContext = .{};
-    const sys_table: r4os.abi.R4XStartR4Sys = .{ .ticks = @intFromPtr(&Peer.ticks) };
+    const sys_table: r4os.abi.R4XStartR4Sys = .{ .ticks = @intFromPtr(&Peer.ticks), .program_kill = @intFromPtr(&Peer.kill) };
     const desk_table: r4os.abi.R4XStartR4Desk = .{
         .console_revision = @intFromPtr(&Peer.readRevision),
         .console_state = @intFromPtr(&Peer.readState),
@@ -5851,6 +5612,27 @@ test "program exit drains the last console revision before channel close" {
     try std.testing.expect(pumpConsoleOutput(&app, 0, &stats, "", buffers, &rng, &seq, &channel));
     scheduleProgramExit(&app, &stats, &channel, 0);
     try std.testing.expect(channel.close_after_output);
+
+    // A retained tail cannot replace unread bytes, even if the producer has
+    // already exited successfully. Report loss and retire this exact child.
+    channel = .{ .shell_started = true, .exec_started = true, .shell_instance = 9 };
+    buffers.channel_output.clear();
+    Peer.output = "tail";
+    Peer.stream_override = 100;
+    Peer.dropped = 96;
+    Peer.revision = 1;
+    try std.testing.expect(pumpConsoleOutput(&app, 0, &stats, "", buffers, &rng, &seq, &channel));
+    try std.testing.expect(channel.close_after_output);
+    try std.testing.expectEqual(@as(u32, 3), channel.close_after_output_status);
+    try std.testing.expectEqual(@as(u32, 9), Peer.killed);
+    try std.testing.expect(std.mem.indexOf(u8, buffers.channel_output.peek(), "lost 96 bytes") != null);
+
+    // Dropping a previously delivered prefix is normal scrolling.
+    channel = .{ .shell_started = true, .exec_started = true, .shell_instance = 10, .last_console_stream_bytes = 96, .last_output_dropped_bytes = 92, .last_output_len = 4 };
+    buffers.channel_output.clear();
+    try std.testing.expect(pumpConsoleOutput(&app, 0, &stats, "", buffers, &rng, &seq, &channel));
+    try std.testing.expect(!channel.close_after_output);
+    try std.testing.expectEqualStrings("tail", buffers.channel_output.peek());
 }
 
 fn sendChannelExitAndClose(app: *const App, conn_id: u32, key: []const u8, buffers: *SessionBuffers, rng: *SessionRng, seq_out: *u32, channel: *ChannelState, exit_code: u32) void {

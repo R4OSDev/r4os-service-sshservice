@@ -12,19 +12,12 @@ nicht als abgeschlossene Ausgabe. Der bestehende Hosttest ruft den echten
 Ausgabepump mit diesem Ablauf, Rueckstau, Revisionswechsel und leerer Ausgabe
 auf; ein unveraenderter Fehler-Exit bleibt dabei erhalten.
 
-Seit 0.60.20 beantwortet SSHD `R4DIAG PING` und `R4DIAG TASKS` direkt im
-Session-Worker. Dieser Diagnosepfad startet weder `TERMINAL.R4X` noch ein
-anderes Programm und fuehrt kein Dateisystem-I/O aus. `TASKS` liefert den
-generationstreuen Program-/Task-Snapshot mit Taskzustand, Owner, letztem
-Lauf-Tick, Alter, Wake-Tick und Laufzeit; parallele Inventarmutationen
-starten den Snapshot begrenzt neu. Alle Taskseiten werden dabei vor der
-ersten SSH-Ausgabe in einem pro Session eigenen Scratchpuffer gesammelt:
-Ein TCPSVC-Write erzeugt selbst einen kurzlebigen Async-I/O-Task und wuerde
-einen noch laufenden generationstreuen Snapshot sonst invalidieren. Erst
-der vollstaendige stabile Snapshot wird ueber SSH ausgegeben. Damit bleibt
-bei einem SYSUPD-/Storage-Wedge ueber denselben SSH-Kanal unterscheidbar, ob
-bereits der Session-Worker steht oder erst Spawn, Terminal beziehungsweise
-Dateisystem nicht mehr fortschreiten.
+Seit 0.83.2 / SSHD 0.1.11 beantwortet der direkte Befehl R4DIAG PING nur
+noch die Erreichbarkeit des SSH-Sessionworkers ohne Spawn und Dateisystem.
+Task-, Programm- und Speicherinventare werden ausschliesslich durch
+SPECTRA METRICS TASKS beziehungsweise LIFECYCLE angezeigt. R4DIAG TASKS
+und dessen separater begrenzter Taskpuffer sind entfernt. Bei blockiertem
+Programmstart bleibt PING erreichbar, ein Kernelinventar braucht Spectra.
 
 SFTP-Schreibvertrag 0.60.20
 ---------------------------
@@ -308,3 +301,9 @@ bewahrt ausschliesslich seine bisherige oeffentliche Identitaet. SSH-Clients
 muessen diese geaenderte Hostidentitaet anschliessend bestaetigen. Markierte
 Schluessel bleiben beim Neustart stabil. Lesefehler, beschaedigte Paare,
 unbekannte Markierungen oder Entropie-/Batchfehler ersetzen keinen Bestand.
+
+Seit 0.83.2 meldet der Konsolentransport ungelesene ueberschriebene Bytes
+als console-output-overrun und beendet den genauen Aufruf mit Status 3.
+Der Kindprozess wird beendet und ueber den bestehenden Abbaupfad geerntet.
+Normales Scrollen bereits gesendeter Bytes sowie explizites CLS bleiben
+zulaessig; ein unvollstaendiger JSON-Stream liefert keinen Erfolgsstatus.
