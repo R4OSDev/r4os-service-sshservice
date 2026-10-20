@@ -4,7 +4,7 @@
 
 ## Package
 
-- Version: `0.1.16`
+- Version: `0.1.17`
 - Image target: `/R4OS/SERVICES/SSHD.R4X`
 - Image scope: `full`
 - Canonical project manifest: `module.R4MF`
@@ -65,3 +65,19 @@ unbekannte Markierungen oder Entropie-/Batchfehler ersetzen keinen Bestand.
 ## Console input
 
 Interactive shell input uses typed UTF-8 stream-byte events bound to the exact spawned process handle. The existing bounded byte queue and SSH receive-window credit retain unaccepted suffixes across packets and queue backpressure. UTF-8 decoding and ANSI key parsing belong to Terminal. CR/LF and DEL normalization remain at the existing channel boundary. The channel tests include split D0 81 and continuation-byte80 with partial acknowledgement and retry.
+UTF8 path profile (0.85.42)
+--------------------------
+SFTP/SCP paths use the shared strict R4STD UTF8 transport validator before
+normalization or filesystem operations. Original spaces and Unicode scalars
+remain intact. NUL, ASCII controls, illegal path characters, partial/malformed
+UTF8 and byte/UTF16-unit overflow fail explicitly. No normalization or guessed
+legacy encoding is applied. Full path identities drive SCP names; SFTP long
+names and entry buffers retain complete supported names instead of clipping.
+ShellPath/SftpRoot retain the full1023-byte API capacity. Path/argument Registry
+reads must be complete and valid before replacing defaults; invalid configured
+values produce a controlled startup error. Existing byte-preserving SFTP/SCP
+payload handling and staged publication/cleanup contracts remain unchanged.
+The SSH channel transports bytes; incremental UTF8 decoding stays in Terminal.
+NTFS $UpCase and FAT ASCII case comparison remain filesystem-owned. Existing
+atomic-publication limits are explicit failures, including unsupported FAT
+long-name publication; file data is never silently redirected or transcoded.

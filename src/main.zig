@@ -1,4 +1,5 @@
 const r4os = @import("r4os");
+const path_text = @import("path_text");
 const std = @import("std");
 const channel_flow = @import("channel_flow.zig");
 const ssh_chacha = @import("ssh_chacha.zig");
@@ -243,9 +244,10 @@ const Config = struct {
     log_passwords: bool = default_log_passwords,
     user_name: [32]u8 = .{0} ** 32,
     password: [32]u8 = .{0} ** 32,
-    shell_path: [128]u8 = .{0} ** 128,
+    shell_path: [sftp_path_capacity]u8 = .{0} ** sftp_path_capacity,
+    paths_valid: bool = true,
     shell_args: [96]u8 = .{0} ** 96,
-    sftp_root: [32]u8 = .{0} ** 32,
+    sftp_root: [sftp_path_capacity]u8 = .{0} ** sftp_path_capacity,
     host_key_type: [32]u8 = .{0} ** 32,
 };
 
@@ -635,6 +637,10 @@ fn runService(app: *const App) i32 {
     if (!config.enabled) {
         app.sys.println("SSHD disabled by Registry");
         return 0;
+    }
+    if (!config.paths_valid) {
+        app.sys.println("SSHD invalid ShellPath/ShellArgs/SftpRoot configuration");
+        return 1;
     }
     var host_key = loadOrCreateHostKey(app, &stats) orelse {
         app.sys.println("SSHD host key unavailable");
@@ -2966,6 +2972,7 @@ fn startRemoteTerminal(app: *const App, stats: *ServiceStats, config: *const Con
 }
 
 fn buildExecTerminalArgs(config: *const Config, command: []const u8, out: []u8) ?[]const u8 {
+    if (!path_text.validText(command)) return null;
     const trimmed_command = trimSpaces(command);
     if (trimmed_command.len == 0) return null;
     var pos: usize = 0;
@@ -3097,8 +3104,8 @@ fn startScpSource(app: *const App, stats: *ServiceStats, config: *const Config, 
     }
 
     const size: usize = @intCast(info.size);
-    const info_name = spanZ(info.name[0..]);
-    const file_name = if (info_name.len != 0) info_name else sftpBaseName(path);
+    // FileInfo.name is a bounded display projection, not the path identity.
+    const file_name = sftpBaseName(path);
     if (!copyScpFileName(channel.scp_name[0..], file_name)) {
         setLastProtocolError(stats, "scp-source-name");
         return false;
@@ -3579,7 +3586,7 @@ fn parseScpFileHeader(line: []const u8) ?ScpFileHeader {
 }
 
 fn buildScpTargetPath(base: []const u8, target_is_dir: bool, name: []const u8, out: []u8) ?[]const u8 {
-    if (base.len == 0) return null;
+    if (base.len == 0 or !path_text.valid(base, sftp_path_capacity - 1)) return null;
     if (!isValidScpFileName(name)) return null;
     var pos: usize = 0;
     if (!appendChecked(out, &pos, base)) return null;
@@ -3629,16 +3636,11 @@ fn copyScpFileName(out: []u8, name: []const u8) bool {
 }
 
 fn isValidScpFileName(name: []const u8) bool {
-    if (name.len == 0 or name.len >= scp_filename_capacity) return false;
-    for (name) |ch| {
-        if (ch == 0 or ch == '\r' or ch == '\n' or ch == ':' or isPathSeparator(ch)) return false;
-    }
-    return true;
+    return name.len < scp_filename_capacity and path_text.validComponent(name);
 }
 
 fn pathEndsWithSeparator(path: []const u8) bool {
-    const trimmed = trimSpaces(path);
-    return trimmed.len != 0 and isPathSeparator(trimmed[trimmed.len - 1]);
+    return path.len != 0 and isPathSeparator(path[path.len - 1]);
 }
 
 fn parseDecimalUsize(text: []const u8) ?usize {
@@ -4331,7 +4333,7 @@ fn handleSftpReadDir(app: *const App, conn_id: u32, stats: *ServiceStats, key: [
     var count: u32 = 0;
     while (count < sftp_readdir_batch_max) {
         var entry_path_buf: [sftp_path_capacity]u8 = .{0} ** sftp_path_capacity;
-        const kind = app.sys.dirEntry(&path_z, index, entry_path_buf[0 .. entry_path_buf.len - 1]);
+        const kind = app.sys.dirEntry(&path_z, index, entry_path_buf[0..]);
         if (kind == r4os.r4sys.dir_entry_result_end) break;
         if (kind < 0) {
             return sendSftpStatus(app, conn_id, stats, key, buffers, rng, seq_out, id, sftp_status_failure, "directory read failed");
@@ -4339,6 +4341,7 @@ fn handleSftpReadDir(app: *const App, conn_id: u32, stats: *ServiceStats, key: [
         const next_index = index + 1;
         const entry_path = spanZ(entry_path_buf[0..]);
         const name = sftpBaseName(entry_path);
+        if (!path_text.valid(entry_path, sftp_path_capacity - 1) or !path_text.validComponent(name)) return sendSftpStatus(app, conn_id, stats, key, buffers, rng, seq_out, id, sftp_status_failure, "invalid directory name");
         if (name.len == 0) {
             index = next_index;
             continue;
@@ -4359,14 +4362,17 @@ fn handleSftpReadDir(app: *const App, conn_id: u32, stats: *ServiceStats, key: [
         }
         if (info.name[0] == 0) copyFixedZ(info.name[0..], name);
 
-        var long_buf: [192]u8 = .{0} ** 192;
-        const long_name = buildSftpLongName(name, info, kind == 1, long_buf[0..]);
-        var entry_buf: [512]u8 = .{0} ** 512;
+        var long_buf: [sftp_path_capacity + 96]u8 = .{0} ** (sftp_path_capacity + 96);
+        const long_name = buildSftpLongName(name, info, kind == 1, long_buf[0..]) orelse return sendSftpStatus(app, conn_id, stats, key, buffers, rng, seq_out, id, sftp_status_failure, "listing name capacity");
+        var entry_buf: [2 * sftp_path_capacity + 128]u8 = .{0} ** (2 * sftp_path_capacity + 128);
         var entry_w = Writer.init(entry_buf[0..]);
         if (!entry_w.string(name)) return false;
         if (!entry_w.string(long_name)) return false;
         if (!writeSftpAttrs(&entry_w, info, kind == 1)) return false;
-        if (w.pos + entry_w.pos > w.buf.len) break;
+        if (w.pos + entry_w.pos > w.buf.len) {
+            if (count == 0) return sendSftpStatus(app, conn_id, stats, key, buffers, rng, seq_out, id, sftp_status_failure, "listing response capacity");
+            break;
+        }
         if (!w.bytes(entry_w.slice())) return false;
 
         index = next_index;
@@ -4386,7 +4392,7 @@ fn handleSftpRealPath(app: *const App, conn_id: u32, stats: *ServiceStats, confi
         return sendSftpStatus(app, conn_id, stats, key, buffers, rng, seq_out, id, sftp_status_no_such_file, "bad path");
     };
     var canonical_buf: [sftp_path_capacity]u8 = .{0} ** sftp_path_capacity;
-    const canonical = r4PathToSftpPath(path, canonical_buf[0..]) orelse default_sftp_root;
+    const canonical = r4PathToSftpPath(path, canonical_buf[0..]) orelse return sendSftpStatus(app, conn_id, stats, key, buffers, rng, seq_out, id, sftp_status_failure, "canonical path capacity");
     var info: r4os.abi.FileInfo = .{};
     const info_rc = app.sys.fileInfoRaw(&path_z, &info);
     if (info_rc < 0) {
@@ -4585,8 +4591,8 @@ fn sendSftpAttrsResponse(app: *const App, conn_id: u32, stats: *ServiceStats, ke
 }
 
 fn sendSftpNameOne(app: *const App, conn_id: u32, stats: *ServiceStats, key: []const u8, buffers: *SessionBuffers, rng: *SessionRng, seq_out: *u32, id: u32, name: []const u8, info: r4os.abi.FileInfo, synth_dir: bool) bool {
-    var long_buf: [192]u8 = .{0} ** 192;
-    const long_name = buildSftpLongName(name, info, synth_dir, long_buf[0..]);
+    var long_buf: [sftp_path_capacity + 96]u8 = .{0} ** (sftp_path_capacity + 96);
+    const long_name = buildSftpLongName(name, info, synth_dir, long_buf[0..]) orelse return sendSftpStatus(app, conn_id, stats, key, buffers, rng, seq_out, id, sftp_status_failure, "listing name capacity");
     var w = Writer.init(buffers.sftp_output[4..]);
     if (!w.byte(sftp_msg_name)) return false;
     if (!w.beU32(id)) return false;
@@ -4626,7 +4632,9 @@ fn writeSftpAttrs(w: *Writer, info: r4os.abi.FileInfo, synth_dir: bool) bool {
     return true;
 }
 
-fn buildSftpLongName(name: []const u8, info: r4os.abi.FileInfo, synth_dir: bool, out: []u8) []const u8 {
+fn buildSftpLongName(name: []const u8, info: r4os.abi.FileInfo, synth_dir: bool, out: []u8) ?[]const u8 {
+    // The largest fixed prefix including a20digit size fits64bytes.
+    if (!path_text.validText(name) or name.len > sftp_path_capacity - 1 or name.len + 64 > out.len) return null;
     var pos: usize = 0;
     const is_dir = synth_dir or info.is_dir != 0;
     appendText(out, &pos, if (is_dir) "drwxrwxrwx" else "-rw-rw-rw-");
@@ -5107,7 +5115,8 @@ fn isPathAtOrBelow(path: []const u8, root: []const u8) bool {
 fn resolveSshFilePath(config: ?*const Config, remote_raw: []const u8, out: []u8) ?[]const u8 {
     if (out.len < 4) return null;
     @memset(out, 0);
-    const remote = trimSpaces(remote_raw);
+    if (!path_text.valid(remote_raw, sftp_path_capacity - 1)) return null;
+    const remote = remote_raw;
     if (remote.len == 0 or bytesEq(remote, ".") or bytesEq(remote, "/")) {
         const root = if (config) |cfg| spanZ(cfg.sftp_root[0..]) else default_sftp_root;
         if (!bytesEq(root, remote_raw)) return resolveSshFilePath(null, root, out);
@@ -5118,7 +5127,7 @@ fn resolveSshFilePath(config: ?*const Config, remote_raw: []const u8, out: []u8)
     if (remote.len >= 2 and isDriveLetter(remote[0]) and remote[1] == ':') {
         drive = upper(remote[0]);
         tail_start = 2;
-    } else if (remote.len >= 2 and (remote[0] == '/' or remote[0] == '\\') and isDriveLetter(remote[1])) {
+    } else if (remote.len >= 2 and (remote[0] == '/' or remote[0] == '\\') and isDriveLetter(remote[1]) and (remote.len == 2 or isPathSeparator(remote[2]) or remote[2] == ':')) {
         drive = upper(remote[1]);
         tail_start = 2;
         if (remote.len > 2 and remote[2] == ':') tail_start = 3;
@@ -5170,6 +5179,7 @@ fn appendCanonicalTail(out: []u8, pos: *usize, floor: usize, tail: []const u8) b
             if (pos.* > floor and out[pos.* - 1] == '\\') pos.* -= 1;
             continue;
         }
+        if (!path_text.validComponent(component)) return false;
         if (pos.* > 0 and out[pos.* - 1] != '\\') {
             if (pos.* + 1 >= out.len) return false;
             out[pos.*] = '\\';
@@ -5183,7 +5193,7 @@ fn appendCanonicalTail(out: []u8, pos: *usize, floor: usize, tail: []const u8) b
 }
 
 fn r4PathToSftpPath(path: []const u8, out: []u8) ?[]const u8 {
-    if (path.len < 2 or path[1] != ':' or !isDriveLetter(path[0]) or out.len < 4) return null;
+    if (!path_text.valid(path, sftp_path_capacity - 1) or path.len < 2 or path[1] != ':' or !isDriveLetter(path[0]) or out.len < 4) return null;
     var pos: usize = 0;
     out[pos] = '/';
     pos += 1;
@@ -6944,9 +6954,9 @@ fn loadConfig(app: *const App) Config {
     config.log_passwords = readRegistryBool(app, "LogPasswords") orelse config.log_passwords;
     _ = readRegistryString(app, "UserName", config.user_name[0..]);
     _ = readRegistryString(app, "Password", config.password[0..]);
-    _ = readRegistryString(app, "ShellPath", config.shell_path[0..]);
-    _ = readRegistryString(app, "ShellArgs", config.shell_args[0..]);
-    _ = readRegistryString(app, "SftpRoot", config.sftp_root[0..]);
+    config.paths_valid = readConfiguredText(app, "ShellPath", config.shell_path[0..], true) and config.paths_valid;
+    config.paths_valid = readConfiguredText(app, "ShellArgs", config.shell_args[0..], false) and config.paths_valid;
+    config.paths_valid = readConfiguredText(app, "SftpRoot", config.sftp_root[0..], true) and config.paths_valid;
     _ = readRegistryString(app, "HostKeyType", config.host_key_type[0..]);
     return config;
 }
@@ -7153,6 +7163,85 @@ fn appendText(out: []u8, pos: *usize, text: []const u8) void {
         out[pos.*] = text[i];
         pos.* += 1;
     }
+}
+
+fn admitConfiguredText(out: []u8, info: r4os.abi.RegistryValueInfo, rc: i32, data: []const u8, is_path: bool) bool {
+    if (rc == r4os.abi.registry_api_result_value_not_found or rc == r4os.abi.registry_api_result_key_not_found or rc == r4os.abi.registry_api_result_hive_not_found) return true;
+    if (rc < 0 or info.value_type != r4os.abi.registry_value_type_string) return false;
+    const got: usize = @intCast(rc);
+    if (got != info.data_len or got > data.len or got >= out.len) return false;
+    const value = data[0..got];
+    if (is_path) {
+        if (got == 0 or !path_text.valid(value, sftp_path_capacity - 1)) return false;
+    } else if (!path_text.validText(value)) return false;
+    @memset(out, 0);
+    @memcpy(out[0..got], value);
+    return true;
+}
+fn readConfiguredText(app: *const App, name: [*:0]const u8, out: []u8, is_path: bool) bool {
+    var info: r4os.abi.RegistryValueInfo = .{};
+    var data: [sftp_path_capacity]u8 = undefined;
+    const rc = app.sys.registryGetValue(registry_key, name, &info, &data);
+    return admitConfiguredText(out, info, rc, &data, is_path);
+}
+
+test "SSH SFTP and SCP path admission retains supplementary names and spaces" {
+    var out: [sftp_path_capacity]u8 = undefined;
+    const wanted = "C:\\TEMP\\ ä🙂.bin ";
+    try std.testing.expectEqualStrings(wanted, resolveSshFilePath(null, "/C/TEMP/ ä🙂.bin ", &out).?);
+    for ([_][]const u8{ "/C/TEMP/\xc1\xa1", "/C/TEMP/\xe0\x80\xaf", "bad\x00/../ok", "\xed\xa0\x80", "\xc3", "x" ** 256 ++ "/../ok", "\x81.bin", "x:y:z" }) |bad| {
+        try std.testing.expect(resolveSshFilePath(null, bad, &out) == null);
+    }
+    try std.testing.expectEqualStrings("C:\\e\xcc\x81", resolveSshFilePath(null, "/C/e\xcc\x81", &out).?);
+    const max_name = "€" ** 253 ++ "🙂";
+    const path = "C:\\TEMP\\" ++ max_name;
+    try std.testing.expectEqualStrings(path, resolveSshFilePath(null, "/C/TEMP/" ++ max_name, &out).?);
+    try std.testing.expect(isValidScpFileName(max_name));
+    try std.testing.expect(!isValidScpFileName(max_name ++ "x"));
+    try std.testing.expectEqualStrings(path, buildScpTargetPath("C:\\TEMP", true, max_name, &out).?);
+    var short: [8]u8 = undefined;
+    try std.testing.expect(resolveSshFilePath(null, "/C/ä🙂.bin", &short) == null);
+}
+
+test "SFTP listing serializes whole maximum Unicode names without clipping" {
+    const name = "€" ** 253 ++ "🙂";
+    var info: r4os.abi.FileInfo = .{ .exists = 1, .size = std.math.maxInt(u64) };
+    var long: [sftp_path_capacity + 96]u8 = undefined;
+    const rendered = buildSftpLongName(name, info, false, &long).?;
+    try std.testing.expect(std.mem.endsWith(u8, rendered, name));
+    try std.testing.expect(std.unicode.utf8ValidateSlice(rendered));
+    var entry: [2 * sftp_path_capacity + 128]u8 = undefined;
+    var writer = Writer.init(&entry);
+    try std.testing.expect(writer.string(name));
+    try std.testing.expect(writer.string(rendered));
+    try std.testing.expect(writeSftpAttrs(&writer, info, false));
+    var small: [32]u8 = @splat(0x5a);
+    try std.testing.expect(buildSftpLongName(name, info, false, &small) == null);
+    try std.testing.expectEqualSlices(u8, &(@as([32]u8, @splat(0x5a))), &small);
+    info.size = 0;
+    try std.testing.expect(buildSftpLongName("\xc3", info, false, &long) == null);
+}
+
+test "SSH configured paths and args require full valid data before replacing defaults" {
+    var out: [32]u8 = @splat(0x5a);
+    var info: r4os.abi.RegistryValueInfo = .{ .value_type = r4os.abi.registry_value_type_string };
+    for ([_][]const u8{ "C:\\bad\x00rest", "C:\\\xc3", "C:\\\x81", "C:\\" ++ "a" ** 40 }) |bad| {
+        info.data_len = @intCast(bad.len);
+        try std.testing.expect(!admitConfiguredText(&out, info, @intCast(bad.len), bad, true));
+        try std.testing.expectEqualSlices(u8, &(@as([32]u8, @splat(0x5a))), &out);
+    }
+    info.data_len = 10;
+    try std.testing.expect(!admitConfiguredText(&out, info, 3, "C:\\", true));
+    try std.testing.expectEqualSlices(u8, &(@as([32]u8, @splat(0x5a))), &out);
+    try std.testing.expect(admitConfiguredText(&out, info, r4os.abi.registry_api_result_value_not_found, "", true));
+    const good = "C:\\ä🙂";
+    info.data_len = good.len;
+    try std.testing.expect(admitConfiguredText(&out, info, good.len, good, true));
+    try std.testing.expectEqualStrings(good, spanZ(&out));
+    const args = "/NOAUTOEXEC /C \"ä🙂\"";
+    info.data_len = args.len;
+    try std.testing.expect(admitConfiguredText(&out, info, args.len, args, false));
+    try std.testing.expectEqualStrings(args, spanZ(&out));
 }
 
 fn appendI32(out: []u8, pos: *usize, value: i32) void {
