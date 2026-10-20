@@ -169,3 +169,34 @@ test "console normalization batches CRLF and DEL across packet boundaries" {
     try std.testing.expectEqual(@as(usize, 1), second.consumed_without_output);
     try std.testing.expect(!skip);
 }
+
+/// No decoding or key inference in the SSH transport. The byte queue retains
+/// split scalars and receives credit only for the events accepted downstream.
+pub fn consoleEvents(input: []const u8, out: []@import("r4os").abi.ConsoleInputEvent) []const @import("r4os").abi.ConsoleInputEvent {
+    const count = @min(@min(input.len, out.len), 64);
+    for (input[0..count], out[0..count]) |byte, *event| event.* = @import("r4os").input_events.utf8Byte(byte);
+    return out[0..count];
+}
+
+test "SSH split UTF8 bytes80/81 survive full queue and acknowledged-prefix retry without key inference" {
+    const r4os = @import("r4os");
+    var queue: ByteQueue(16) = .{};
+    const original = "\xc3\xbc\xe2\x82\xac\xd0\x81\xc4\x80\xf0\x9f\x98\x80";
+    try std.testing.expect(queue.append(original[0..6]));
+    var batch: [64]r4os.abi.ConsoleInputEvent = undefined;
+    var first = consoleEvents(queue.peek(), &batch);
+    for (first) |event| try std.testing.expectEqual(r4os.abi.console_input_event_utf8_byte, event.kind);
+    // A full downstream queue acknowledges nothing, retaining the D0 prefix.
+    try std.testing.expect(queue.consume(0));
+    try std.testing.expectEqualStrings(original[0..6], queue.peek());
+    try std.testing.expect(queue.consume(5));
+    try std.testing.expect(queue.append(original[6..]));
+    first = consoleEvents(queue.peek(), &batch);
+    try std.testing.expectEqual(@as(u32, 0xd0), first[0].value);
+    try std.testing.expectEqual(@as(u32, 0x81), first[1].value);
+    var restored: [8]u8 = undefined;
+    for (first, &restored) |event, *byte| byte.* = @intCast(event.value);
+    try std.testing.expectEqualStrings(original[5..], &restored);
+    try std.testing.expect(queue.consume(first.len));
+    try std.testing.expect(queue.empty());
+}

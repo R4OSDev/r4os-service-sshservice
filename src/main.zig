@@ -7,7 +7,9 @@ const sftp_write_policy = @import("sftp_write_policy.zig");
 const Sha256 = r4os.crypto_sha256.Sha256(shaExecutor);
 var sha_executor: ?r4os.cpu_acceleration.WorkFn = null;
 var memory_policy: r4os.cpu_memory.Policy = .{};
-fn shaExecutor() ?r4os.cpu_acceleration.WorkFn { return sha_executor; }
+fn shaExecutor() ?r4os.cpu_acceleration.WorkFn {
+    return sha_executor;
+}
 const Ed25519 = std.crypto.sign.Ed25519;
 const X25519 = std.crypto.dh.X25519;
 const Poly1305 = std.crypto.onetimeauth.Poly1305;
@@ -512,6 +514,7 @@ const ChannelState = struct {
     send_window: channel_flow.SendWindow = .{},
     receive_window_remaining: u32 = ssh_channel_window,
     shell_instance: u32 = 0,
+    shell_handle: r4os.abi.ProgramProcessHandle = .{},
     shell_skip_next_lf: bool = false,
     cols: u32 = 80,
     rows: u32 = 25,
@@ -2855,7 +2858,9 @@ fn pumpShellInput(app: *const App, conn_id: u32, stats: *ServiceStats, key: []co
     if (!channel.shell_started or channel.shell_instance == 0 or buffers.console_input.empty()) return true;
     const pending = buffers.console_input.peek();
     stats.shell_input_batches +%= 1;
-    const accepted_raw = app.sys.consolePushInput(channel.shell_instance, pending);
+    var events: [64]r4os.abi.ConsoleInputEvent = undefined;
+    const batch = channel_flow.consoleEvents(pending, &events);
+    const accepted_raw = app.sys.consolePushEvents(channel.shell_handle, batch);
     if (accepted_raw < 0) {
         setLastProtocolError(stats, "shell-input-push");
         return false;
@@ -2864,7 +2869,8 @@ fn pumpShellInput(app: *const App, conn_id: u32, stats: *ServiceStats, key: []co
         stats.shell_input_backpressure +%= 1;
         return true;
     }
-    const accepted = @min(@as(usize, @intCast(accepted_raw)), pending.len);
+    if (accepted_raw > batch.len) return false;
+    const accepted: usize = @intCast(accepted_raw);
     if (!buffers.console_input.consume(accepted)) return false;
     stats.shell_input_accepted +%= @intCast(accepted);
     return ackChannelInputWindow(app, conn_id, stats, key, channel, buffers, rng, seq_out, accepted);
@@ -2921,21 +2927,28 @@ const RemoteProgramKind = enum {
 fn startRemoteTerminal(app: *const App, stats: *ServiceStats, config: *const Config, channel: *ChannelState, args: []const u8, kind: RemoteProgramKind, command: []const u8) bool {
     var path_z: [128:0]u8 = .{0} ** 128;
     var args_z: [128:0]u8 = .{0} ** 128;
-    copyFixedZ(path_z[0..], spanZ(config.shell_path[0..]));
-    copyFixedZ(args_z[0..], args);
-    const instance_raw = app.sys.programSpawnWithConsoleHost(&path_z, &args_z, .console, .terminal_mode);
-    if (instance_raw <= 0) {
+    const path = spanZ(config.shell_path[0..]);
+    if (path.len > path_z.len or args.len > args_z.len) {
+        setLastProtocolError(stats, "shell-arguments-too-long");
+        return false;
+    }
+    @memcpy(path_z[0..path.len], path);
+    @memcpy(args_z[0..args.len], args);
+    var shell_handle: r4os.abi.ProgramProcessHandle = .{};
+    const instance_raw = app.sys.programSpawnWithConsoleHostHandle(&path_z, &args_z, .console, .terminal_mode, &shell_handle);
+    if (instance_raw != r4os.abi.program_handle_ok) {
         setLastProtocolError(stats, if (kind == .exec) "exec-spawn" else "shell-spawn");
         app.sys.write("SSHD terminal spawn failed rc=");
         app.sys.printI32(instance_raw);
         app.sys.println("");
         return false;
     }
-    const instance_id: u32 = @intCast(instance_raw);
+    const instance_id = shell_handle.instance_id;
     if (kind == .shell) _ = app.sys.consoleSetMetrics(instance_id, channel.cols, channel.rows);
     channel.shell_started = true;
     channel.exec_started = kind == .exec;
     channel.shell_instance = instance_id;
+    channel.shell_handle = shell_handle;
     channel.last_activity_tick = app.sys.ticks();
     if (kind == .exec) {
         noteSessionKind(stats, "exec", command);
@@ -5557,7 +5570,10 @@ test "program exit drains the last console revision before channel close" {
             state.* = .{ .output_len = @intCast(output.len), .stdout_bytes = stream_override orelse @intCast(output.len), .output_dropped_bytes = dropped };
             return 0;
         }
-        fn kill(id: u32) callconv(.c) i32 { killed = id; return 0; }
+        fn kill(id: u32) callconv(.c) i32 {
+            killed = id;
+            return 0;
+        }
         fn readOutput(_: u32, bytes: [*]u8, capacity: u32) callconv(.c) i32 {
             std.debug.assert(capacity > output.len);
             @memcpy(bytes[0..output.len], output);

@@ -4,7 +4,7 @@
 
 ## Package
 
-- Version: `0.1.10`
+- Version: `0.1.16`
 - Image target: `/R4OS/SERVICES/SSHD.R4X`
 - Image scope: `full`
 - Canonical project manifest: `module.R4MF`
@@ -61,3 +61,7 @@ bewahrt ausschliesslich seine bisherige oeffentliche Identitaet. SSH-Clients
 muessen diese geaenderte Hostidentitaet anschliessend bestaetigen. Markierte
 Schluessel bleiben beim Neustart stabil. Lesefehler, beschaedigte Paare,
 unbekannte Markierungen oder Entropie-/Batchfehler ersetzen keinen Bestand.
+
+## Console input
+
+Interactive shell input uses typed UTF-8 stream-byte events bound to the exact spawned process handle. The existing bounded byte queue and SSH receive-window credit retain unaccepted suffixes across packets and queue backpressure. UTF-8 decoding and ANSI key parsing belong to Terminal. CR/LF and DEL normalization remain at the existing channel boundary. The channel tests include split D0 81 and continuation-byte80 with partial acknowledgement and retry.
