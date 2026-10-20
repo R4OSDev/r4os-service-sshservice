@@ -4,7 +4,10 @@ const channel_flow = @import("channel_flow.zig");
 const ssh_chacha = @import("ssh_chacha.zig");
 const sftp_write_policy = @import("sftp_write_policy.zig");
 
-const Sha256 = std.crypto.hash.sha2.Sha256;
+const Sha256 = r4os.crypto_sha256.Sha256(shaExecutor);
+var sha_executor: ?r4os.cpu_acceleration.WorkFn = null;
+var memory_policy: r4os.cpu_memory.Policy = .{};
+fn shaExecutor() ?r4os.cpu_acceleration.WorkFn { return sha_executor; }
 const Ed25519 = std.crypto.sign.Ed25519;
 const X25519 = std.crypto.dh.X25519;
 const Poly1305 = std.crypto.onetimeauth.Poly1305;
@@ -605,6 +608,15 @@ const SessionRng = struct {
 
 pub fn r4_app_main(r4_app: *r4os.App) i32 {
     var app = App.init(r4_app) orelse return r4os.abi.err_no_group;
+    // Set once before any service worker starts; kernel code pointers remain
+    // resident and every SHA call still obtains its own exact execution grant.
+    const dev = r4os.r4dev.Context.fromProgram(app.sys.base);
+    var info: r4os.abi.CpuAccelerationInfo = .{};
+    if (dev.cpuAccelerationInfo(&info) == 0) {
+        memory_policy = .fromInfo(&info);
+        if (info.os_mask & r4os.abi.cpu_accel_feature_sha != 0)
+            sha_executor = dev.cpuAccelerationWorkFunction();
+    }
     if (hasArg(app.sys.argsRaw(), selftest_arg)) return runSelfTest(&app);
     if (hasArg(app.sys.argsRaw(), ping_arg)) return runPingClient(&app);
     if (hasArg(app.sys.argsRaw(), status_arg)) return runStatusClient(&app);
@@ -5685,7 +5697,7 @@ fn appendPlainPreload(buffers: *SessionBuffers, data: []const u8) bool {
     else
         0;
     if (active != 0 and buffers.preloaded_plain_pos != 0) {
-        std.mem.copyForwards(u8, buffers.preloaded_plain[0..active], buffers.preloaded_plain[buffers.preloaded_plain_pos..buffers.preloaded_plain_len]);
+        memory_policy.move(buffers.preloaded_plain[0..active], buffers.preloaded_plain[buffers.preloaded_plain_pos..buffers.preloaded_plain_len]);
         buffers.preloaded_plain_pos = 0;
         buffers.preloaded_plain_len = active;
     } else if (active == 0) {
@@ -5693,7 +5705,7 @@ fn appendPlainPreload(buffers: *SessionBuffers, data: []const u8) bool {
         buffers.preloaded_plain_len = 0;
     }
     if (buffers.preloaded_plain_len + data.len > buffers.preloaded_plain.len) return false;
-    @memcpy(buffers.preloaded_plain[buffers.preloaded_plain_len .. buffers.preloaded_plain_len + data.len], data);
+    memory_policy.move(buffers.preloaded_plain[buffers.preloaded_plain_len .. buffers.preloaded_plain_len + data.len], data);
     buffers.preloaded_plain_len += data.len;
     return true;
 }
@@ -5706,7 +5718,7 @@ fn drainPlainPreload(buffers: *SessionBuffers, out: []u8) usize {
     }
     const available = buffers.preloaded_plain_len - buffers.preloaded_plain_pos;
     const take = @min(out.len, available);
-    @memcpy(out[0..take], buffers.preloaded_plain[buffers.preloaded_plain_pos .. buffers.preloaded_plain_pos + take]);
+    memory_policy.move(out[0..take], buffers.preloaded_plain[buffers.preloaded_plain_pos .. buffers.preloaded_plain_pos + take]);
     buffers.preloaded_plain_pos += take;
     if (buffers.preloaded_plain_pos >= buffers.preloaded_plain_len) {
         buffers.preloaded_plain_pos = 0;
@@ -5793,7 +5805,7 @@ fn readPlainPacket(app: *const App, conn_id: u32, out: []u8, buffers: *SessionBu
     if (padding_len < 4 or padding_len + 1 > packet_len_usize) return null;
     const payload_len = packet_len_usize - padding_len - 1;
     if (payload_len > out.len) return null;
-    @memcpy(out[0..payload_len], buffers.packet_body[1 .. 1 + payload_len]);
+    memory_policy.move(out[0..payload_len], buffers.packet_body[1 .. 1 + payload_len]);
     setPacketReadLens(stats, packet_len, payload_len);
     setPacketReadDiag(stats, "plain-payload", payload_len, payload_len);
     seq_in.* +%= 1;
@@ -6694,6 +6706,25 @@ fn runStatusClient(app: *const App) i32 {
 
 fn runSelfTest(app: *const App) i32 {
     app.sys.println("SSHD selftest");
+    var data: [4097]u8 = undefined;
+    for (&data, 0..) |*b, i| b.* = @truncate(i *% 73);
+    var expected: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(&data, &expected, .{});
+    var hash = Sha256.init(.{});
+    hash.update(data[0..17]);
+    hash.update(data[17..]);
+    const result = hash.finalResult();
+    if (!std.mem.eql(u8, &expected, &result)) return fail(app, "sha256");
+    var copied: [4097]u8 = undefined;
+    memory_policy.move(&copied, &data);
+    if (!std.mem.eql(u8, &copied, &data)) return fail(app, "memory-copy");
+    memory_policy.move(copied[0..4096], copied[1..4097]);
+    if (!std.mem.eql(u8, copied[0..4096], data[1..4097])) return fail(app, "memory-overlap");
+    app.sys.write("SSHD selftest: SHA256/memory OK accepted_blocks=");
+    app.sys.printU64(hash.accepted_blocks);
+    app.sys.write(" refused_windows=");
+    app.sys.printU64(hash.refused_windows);
+    app.sys.println("");
     if (!app.sys.hasFn("service_call")) return fail(app, "service-api");
     const repairs = ensureRegistryDefaults(app);
     var config = loadConfig(app);
