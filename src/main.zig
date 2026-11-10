@@ -229,7 +229,7 @@ const App = struct {
     sys: r4os.r4sys.Context,
     net: r4os.r4net.Context,
 
-    fn init(r4_app: *r4os.App) ?App {
+    fn init(r4_app: *r4os.App2) ?App {
         return .{
             .sys = r4_app.system(),
             .net = r4_app.networkLowLevel() orelse return null,
@@ -515,7 +515,6 @@ const ChannelState = struct {
     server_channel: u32 = 0,
     send_window: channel_flow.SendWindow = .{},
     receive_window_remaining: u32 = ssh_channel_window,
-    shell_instance: u32 = 0,
     shell_handle: r4os.abi.ProgramProcessHandle = .{},
     shell_skip_next_lf: bool = false,
     cols: u32 = 80,
@@ -611,7 +610,7 @@ const SessionRng = struct {
     }
 };
 
-pub fn r4_app_main(r4_app: *r4os.App) i32 {
+pub fn r4_app_main(r4_app: *r4os.App2) i32 {
     var app = App.init(r4_app) orelse return r4os.abi.err_no_group;
     // Set once before any service worker starts; kernel code pointers remain
     // resident and every SHA call still obtains its own exact execution grant.
@@ -622,9 +621,13 @@ pub fn r4_app_main(r4_app: *r4os.App) i32 {
         if (info.os_mask & r4os.abi.cpu_accel_feature_sha != 0)
             sha_executor = dev.cpuAccelerationWorkFunction();
     }
-    if (hasArg(app.sys.argsRaw(), selftest_arg)) return runSelfTest(&app);
-    if (hasArg(app.sys.argsRaw(), ping_arg)) return runPingClient(&app);
-    if (hasArg(app.sys.argsRaw(), status_arg)) return runStatusClient(&app);
+    const action = serviceAction(r4_app) catch return r4os.abi.service_api_result_invalid;
+    switch (action) {
+        .selftest => return runSelfTest(&app),
+        .ping => return runPingClient(&app),
+        .status => return runStatusClient(&app),
+        .run => {},
+    }
     return runService(&app);
 }
 
@@ -654,8 +657,14 @@ fn runService(app: *const App) i32 {
 
     var info: r4os.abi.ServiceInfo = .{};
     var endpoint_handle: u32 = 0;
-    var waited: u32 = 0;
-    while (waited < service_register_wait_ticks and endpoint_handle == 0) : (waited += 1) {
+    const actual = app.sys.base.generation2 orelse return r4os.abi.err_no_group;
+    const clock = r4os.inventory_reader.PlatformClock.fromContext2(actual) catch return r4os.abi.err_no_fn;
+    var registration = r4os.rpc_budget.Budget.fromTicks(clock.read, service_register_wait_ticks) catch |err| return r4os.rpc_budget.code(err);
+    while (endpoint_handle == 0 and !app.sys.programShouldClose()) {
+        _ = registration.remainingTicks() catch |err| {
+            if (err == error.TimedOut) break;
+            return r4os.rpc_budget.code(err);
+        };
         const rc = app.sys.serviceEndpointRegister(service_name, 0, &info);
         if (rc == r4os.abi.service_api_result_ok and info.handle != 0) {
             endpoint_handle = info.handle;
@@ -1127,6 +1136,10 @@ fn pollClient(app: *const App, stats: *ServiceStats, config: *const Config, host
     stats.last_tcp_result = if (rc == 0) structured.result else rc;
     stats.last_accept_flags = structured.flags;
     if (structured.handle != 0) stats.last_accept_handle = structured.handle;
+    if (rc < 0 and acceptLostListener(&structured)) {
+        _ = listenOnce(app, config.listen_port, stats, tcpServiceWaitTicks(app));
+        return false;
+    }
     if (rc == 0) {
         stats.accept_empty +%= 1;
         return false;
@@ -1413,10 +1426,9 @@ fn pollSessionWorkers(app: *const App, stats: *ServiceStats, sessions: []Session
             join_rc == r4os.abi.thread_error_busy)
             continue;
         if (join_rc != r4os.abi.thread_ok) {
+            // Only a successful join retires the worker and its borrowed
+            // session/app storage. A provider error is not a join receipt.
             stats.session_worker_join_errors +%= 1;
-            stats.active_sessions -|= 1;
-            freeSessionScratch(app, stats, slot);
-            slot.* = .{};
             continue;
         }
         slot.exit_code = exit_code;
@@ -1429,11 +1441,41 @@ fn stopSessionWorkers(app: *const App, stats: *ServiceStats, sessions: []Session
     while (i < sessions.len) : (i += 1) {
         if (sessions[i].used and sessions[i].conn_id != 0) _ = tcpAbortServiceWait(app, sessions[i].conn_id, tcpServiceCleanupWaitTicks(app));
     }
-    var waited: u32 = 0;
-    while (waited < 8 and stats.active_sessions != 0) : (waited += 1) {
-        pollSessionWorkers(app, stats, sessions, true);
+    // Readiness only wakes the owner. Each exact worker is retired by a
+    // successful join, not by an event, timeout or failed abort.
+    var set: r4os.wait_set.Set = undefined;
+    const actual = app.sys.base.generation2;
+    const created = if (actual) |ctx| r4os.wait_set.Set.init(ctx, @intCast(sessions.len), &set) == 0 else false;
+    defer if (created) {
+        while (set.handle != 0 and set.close() != 0) app.sys.sleepTicks(1);
+    };
+    var enrolled: usize = 0;
+    if (created) {
+        for (sessions, 0..) |slot, index| {
+            if (!slot.used) continue;
+            var source: r4os.abi.WaitSource = .{};
+            if (r4os.wait_set.prepare(actual.?, r4os.wait_set.thread(slot.thread_handle, index), &source) != 0) continue;
+            var registration: u64 = 0;
+            if (set.enroll(source, &registration) == 0) enrolled += 1;
+        }
+    }
+    while (stats.active_sessions != 0) {
+        pollSessionWorkers(app, stats, sessions, enrolled == 0);
+        if (stats.active_sessions == 0) break;
+        if (enrolled != 0 and waitForWorkerSignal(app, &set)) continue;
         app.sys.sleepTicks(1);
     }
+}
+
+fn waitForWorkerSignal(app: *const App, set: *r4os.wait_set.Set) bool {
+    const time = r4os.time_contract.checked;
+    const now = app.sys.base.clockSampleChecked() catch return false;
+    const ns = time.scaleCeil(session_stop_join_ticks, r4os.abi.nanoseconds_per_second, now.identity.tick_hz) catch return false;
+    const budget = time.DeadlineBudget.init(now, .{ .kind = r4os.abi.timeout_kind_finite, .nanoseconds = ns }) catch return false;
+    const limit = r4os.wait_set.deadline(budget) catch return false;
+    var events: [session_worker_slots_max]r4os.abi.WaitSetEvent = undefined;
+    var batch: r4os.abi.WaitSetBatch = .{};
+    return set.wait(limit, &events, &batch) >= 0;
 }
 
 fn finishTcpSession(app: *const App, slot: *SessionWorkerSlot, force_abort: bool) void {
@@ -1658,27 +1700,42 @@ fn mergeLatestFailedAuth(out: *ServiceStats, session: *const ServiceStats) void 
     copyLatestZ(out.last_failed_auth_password[0..], session.last_failed_auth_password[0..]);
 }
 
+fn listenOnce(app: *const App, port: u16, stats: *ServiceStats, ticks: u64) bool {
+    var result: r4os.abi.NetServiceTcpResult = .{};
+    const rc = app.net.tcpListenServiceResultWait(port, &result, ticks);
+    stats.last_tcp_result = if (rc == 0) result.result else rc;
+    if (rc != 0 or result.result != r4os.abi.tcp_result_ok) return false;
+    app.sys.write("SSHD listen ");
+    app.sys.printU64(port);
+    app.sys.println(": ready");
+    return true;
+}
+
 fn waitForListen(app: *const App, port: u16, stats: *ServiceStats) bool {
-    var waited: u32 = 0;
-    while (waited < listen_wait_ticks) : (waited += 1) {
-        var result: r4os.abi.NetServiceTcpResult = .{};
-        const rc = tcpListenServiceResultWait(app, port, &result, tcpServiceWaitTicks(app));
-        stats.last_tcp_result = if (rc == 0) result.result else rc;
-        if (rc == 0 and result.result == 0) {
-            app.sys.write("SSHD listen ");
-            app.sys.printU64(@intCast(port));
-            app.sys.println(": ready");
-            return true;
-        }
-        if (waited == 0) {
-            app.sys.write("SSHD waiting for TCPSVC/network on port ");
-            app.sys.printU64(@intCast(port));
-            app.sys.println("");
-        }
+    const actual = app.sys.base.generation2 orelse return false;
+    const clock = r4os.inventory_reader.PlatformClock.fromContext2(actual) catch return false;
+    var budget = r4os.rpc_budget.Budget.fromTicks(clock.read, listen_wait_ticks) catch return false;
+    var first = true;
+    while (!app.sys.programShouldClose()) {
+        const left = budget.remainingTicks() catch break;
+        if (listenOnce(app, port, stats, @min(left, tcpServiceWaitTicks(app)))) return true;
+        if (first) app.sys.println("SSHD waiting for TCPSVC/network");
+        first = false;
         app.sys.sleepTicks(1);
     }
     stats.tcp_errors +%= 1;
     return false;
+}
+
+// A structured listener failure is different from an empty accept or an
+// unavailable RPC. Re-register the same port; never discard a session here.
+fn acceptLostListener(result: *const r4os.abi.NetServiceTcpResult) bool {
+    return result.action == r4os.abi.net_service_tcp_action_accept_poll and
+        result.result == r4os.abi.tcp_result_bad_state and
+        result.conn_id == 0 and
+        result.flags & r4os.abi.net_service_tcp_flag_lifecycle_valid != 0 and
+        (result.lifecycle_cause == r4os.abi.net_service_socket_lifecycle_timeout or
+        result.lifecycle_cause == r4os.abi.net_service_socket_lifecycle_bad_handle);
 }
 
 fn closeListener(app: *const App, port: u16) void {
@@ -1725,9 +1782,6 @@ fn tcpAcceptPollServiceResultWait(app: *const App, port: u16, accept: *r4os.abi.
     return app.net.tcpAcceptPollServiceResultWait(port, accept, result, wait_ticks);
 }
 
-fn tcpListenServiceResultWait(app: *const App, port: u16, result: *r4os.abi.NetServiceTcpResult, wait_ticks: u64) i32 {
-    return app.net.tcpListenServiceResultWait(port, result, wait_ticks);
-}
 
 fn tcpCloseListenService(app: *const App, port: u16) i32 {
     return app.net.tcpCloseListenService(port);
@@ -2254,6 +2308,7 @@ fn handleConnectionSession(
 ) i32 {
     var channel = ChannelState{ .last_activity_tick = app.sys.ticks(), .session_slot = session_slot };
     syncSessionWatch(session_slot, &channel);
+    defer retireRemoteProgram(app, &channel.shell_handle);
     defer abortActiveTransfers(app, stats, &channel, "session-end");
     defer clearSessionWatch(session_slot);
     const setup_timeout = app.sys.ticksFromMilliseconds(session_timeout_ms);
@@ -2342,18 +2397,18 @@ fn handleConnectionSession(
         if (channel.send_window.stalled(app.sys.ticks(), app.sys.ticksFromMilliseconds(channel_window_stall_timeout_ms))) {
             stats.channel_window_stall_timeouts +%= 1;
             abortActiveTransfers(app, stats, &channel, "channel-window-timeout");
-            if (channel.shell_instance != 0 and !remoteProgramDone(app, channel.shell_instance)) _ = app.sys.programKill(channel.shell_instance);
+            if (channel.shell_handle.instance_id != 0 and !remoteProgramDone(app, &channel.shell_handle)) _ = app.sys.programHandleKill(&channel.shell_handle);
             noteChannelExit(stats, -9);
             noteCloseReason(stats, "channel-window-timeout");
             setLastProtocolError(stats, "channel-window-timeout");
             buffers.channel_output.clear();
             sendChannelExitAndClose(app, conn_id, s2c_key, buffers, rng, seq_out, &channel, 1);
-            reapProgramInstance(app, channel.shell_instance);
+
             return 0;
         }
         if (channel.close_after_output and buffers.channel_output.empty()) {
             sendChannelExitAndClose(app, conn_id, s2c_key, buffers, rng, seq_out, &channel, channel.close_after_output_status);
-            reapProgramInstance(app, channel.shell_instance);
+
             return 0;
         }
 
@@ -2372,7 +2427,7 @@ fn handleConnectionSession(
         }
 
         if (!channel.close_after_output and channel.shell_started) {
-            if (remoteProgramExitCode(app, channel.shell_instance)) |exit_code| {
+            if (remoteProgramExitCode(app, &channel.shell_handle)) |exit_code| {
                 scheduleProgramExit(app, stats, &channel, exit_code);
             }
         }
@@ -2391,13 +2446,13 @@ fn handleConnectionSession(
             channel.last_console_change_tick != 0 and
             exec_settle_ticks != 0 and
             now -| channel.last_console_change_tick >= exec_settle_ticks and
-            (channel.shell_instance == 0 or remoteProgramDone(app, channel.shell_instance)))
+            (channel.shell_handle.instance_id == 0 or remoteProgramDone(app, &channel.shell_handle)))
         {
             scheduleProgramExit(app, stats, &channel, 0);
         }
 
         if (!channel.close_after_output and channel.client_eof and !channel.exec_started and channel.eof_tick != 0 and now -| channel.eof_tick >= eof_grace) {
-            if (channel.shell_instance != 0 and !remoteProgramDone(app, channel.shell_instance)) _ = app.sys.programKill(channel.shell_instance);
+            if (channel.shell_handle.instance_id != 0 and !remoteProgramDone(app, &channel.shell_handle)) _ = app.sys.programHandleKill(&channel.shell_handle);
             noteChannelExit(stats, 0);
             noteCloseReason(stats, "client-eof");
             scheduleChannelClose(&channel, 0);
@@ -2408,8 +2463,8 @@ fn handleConnectionSession(
             // (fail_pkt=last_activity, fail_pay=now via fail-Diagfelder).
             setPacketReadFail(stats, "idle-dbg", @intCast(now & 0xffff_ffff), @intCast(channel.last_activity_tick & 0xffff_ffff));
             var exit_code: i32 = 0;
-            if (channel.shell_instance != 0 and !remoteProgramDone(app, channel.shell_instance)) {
-                _ = app.sys.programKill(channel.shell_instance);
+            if (channel.shell_handle.instance_id != 0 and !remoteProgramDone(app, &channel.shell_handle)) {
+                _ = app.sys.programHandleKill(&channel.shell_handle);
                 exit_code = -9;
             }
             stats.channel_idle_timeouts +%= 1;
@@ -2478,7 +2533,7 @@ fn handleConnectionSession(
     }
 
     noteCloseReason(stats, "service-stop");
-    if (channel.shell_instance != 0 and !remoteProgramDone(app, channel.shell_instance)) _ = app.sys.programKill(channel.shell_instance);
+    if (channel.shell_handle.instance_id != 0 and !remoteProgramDone(app, &channel.shell_handle)) _ = app.sys.programHandleKill(&channel.shell_handle);
     return 0;
 }
 
@@ -2499,8 +2554,8 @@ fn finishClientDisconnect(app: *const App, stats: *ServiceStats, channel: *Chann
     noteChannelExit(stats, -9);
     noteCloseReason(stats, reason);
     setLastProtocolError(stats, reason);
-    if (channel.shell_instance != 0 and !remoteProgramDone(app, channel.shell_instance)) _ = app.sys.programKill(channel.shell_instance);
-    reapProgramInstance(app, channel.shell_instance);
+    if (channel.shell_handle.instance_id != 0 and !remoteProgramDone(app, &channel.shell_handle)) _ = app.sys.programHandleKill(&channel.shell_handle);
+
 }
 
 const ChannelAction = enum {
@@ -2572,10 +2627,10 @@ fn handleChannelMessage(
         ssh_msg_channel_close => {
             if (!channelTargetMatches(payload, channel.server_channel)) return .protocol_error;
             stats.channel_client_closes +%= 1;
-            if (channel.shell_instance != 0 and !remoteProgramDone(app, channel.shell_instance)) {
+            if (channel.shell_handle.instance_id != 0 and !remoteProgramDone(app, &channel.shell_handle)) {
                 stats.client_aborts +%= 1;
                 noteCloseReason(stats, "client-close-abort");
-                _ = app.sys.programKill(channel.shell_instance);
+                _ = app.sys.programHandleKill(&channel.shell_handle);
             } else {
                 noteCloseReason(stats, "client-close");
             }
@@ -2718,7 +2773,7 @@ fn handleChannelRequest(app: *const App, conn_id: u32, stats: *ServiceStats, con
         channel.pty = true;
         channel.cols = clampU32(cols, 20, 240);
         channel.rows = clampU32(rows, 10, 80);
-        if (channel.shell_instance != 0) _ = app.sys.consoleSetMetrics(channel.shell_instance, channel.cols, channel.rows);
+        if (channel.shell_handle.instance_id != 0) _ = app.sys.consoleSetMetrics(channel.shell_handle.instance_id, channel.cols, channel.rows);
         if (want_reply) _ = sendChannelRequestReply(app, conn_id, key, buffers, rng, seq_out, channel.client_channel, true);
         return .continue_session;
     }
@@ -2730,7 +2785,7 @@ fn handleChannelRequest(app: *const App, conn_id: u32, stats: *ServiceStats, con
         _ = r.readU32() orelse return .protocol_error;
         channel.cols = clampU32(cols, 20, 240);
         channel.rows = clampU32(rows, 10, 80);
-        if (channel.shell_instance != 0) _ = app.sys.consoleSetMetrics(channel.shell_instance, channel.cols, channel.rows);
+        if (channel.shell_handle.instance_id != 0) _ = app.sys.consoleSetMetrics(channel.shell_handle.instance_id, channel.cols, channel.rows);
         return .continue_session;
     }
 
@@ -2833,7 +2888,7 @@ fn handleChannelData(app: *const App, conn_id: u32, stats: *ServiceStats, config
         }
         return action;
     }
-    if (!channel.shell_started or channel.shell_instance == 0) return .continue_session;
+    if (!channel.shell_started or channel.shell_handle.instance_id == 0) return .continue_session;
     stats.channel_data_in +%= @intCast(data.len);
     if (!pushShellInput(app, conn_id, stats, key, channel, buffers, rng, seq_out, data)) return .protocol_error;
     return .continue_session;
@@ -2861,7 +2916,7 @@ fn pushShellInput(app: *const App, conn_id: u32, stats: *ServiceStats, key: []co
 }
 
 fn pumpShellInput(app: *const App, conn_id: u32, stats: *ServiceStats, key: []const u8, channel: *ChannelState, buffers: *SessionBuffers, rng: *SessionRng, seq_out: *u32) bool {
-    if (!channel.shell_started or channel.shell_instance == 0 or buffers.console_input.empty()) return true;
+    if (!channel.shell_started or channel.shell_handle.instance_id == 0 or buffers.console_input.empty()) return true;
     const pending = buffers.console_input.peek();
     stats.shell_input_batches +%= 1;
     var events: [64]r4os.abi.ConsoleInputEvent = undefined;
@@ -2953,7 +3008,6 @@ fn startRemoteTerminal(app: *const App, stats: *ServiceStats, config: *const Con
     if (kind == .shell) _ = app.sys.consoleSetMetrics(instance_id, channel.cols, channel.rows);
     channel.shell_started = true;
     channel.exec_started = kind == .exec;
-    channel.shell_instance = instance_id;
     channel.shell_handle = shell_handle;
     channel.last_activity_tick = app.sys.ticks();
     if (kind == .exec) {
@@ -3668,26 +3722,26 @@ fn pumpConsoleOutput(app: *const App, conn_id: u32, stats: *ServiceStats, key: [
     _ = key;
     _ = rng;
     _ = seq_out;
-    if (!channel.shell_started or channel.shell_instance == 0) return true;
+    if (!channel.shell_started or channel.shell_handle.instance_id == 0) return true;
     if (!buffers.channel_output.empty()) return true;
     // State counters and transcript bytes are separate kernel calls. A
     // producer can append between them; combining old counters with newer
     // bytes replays a prefix on the next pump. Accept one stable revision,
     // otherwise retry on the next service iteration without moving cursors.
-    const revision = app.sys.consoleRevision(channel.shell_instance);
+    const revision = app.sys.consoleRevision(channel.shell_handle.instance_id);
     var state: r4os.abi.ConsoleState = .{};
-    const state_rc = app.sys.consoleState(channel.shell_instance, &state);
+    const state_rc = app.sys.consoleState(channel.shell_handle.instance_id, &state);
     stats.last_console_state_rc = state_rc;
     stats.last_console_state_len = state.output_len;
     stats.last_console_stream_bytes = state.stdout_bytes +% state.stderr_bytes;
     if (state_rc < 0) return false;
-    const got_raw = app.sys.consoleOutput(channel.shell_instance, buffers.console_output[0..]);
+    const got_raw = app.sys.consoleOutput(channel.shell_handle.instance_id, buffers.console_output[0..]);
     if (got_raw < 0) {
         stats.last_console_read_len = 0;
         return false;
     }
     const got: usize = @intCast(got_raw);
-    if (app.sys.consoleRevision(channel.shell_instance) != revision or
+    if (app.sys.consoleRevision(channel.shell_handle.instance_id) != revision or
         got != @min(@as(usize, state.output_len), buffers.console_output.len - 1)) return true;
     stats.last_console_read_len = @intCast(@min(got, std.math.maxInt(u32)));
     const stream_bytes = state.stdout_bytes +% state.stderr_bytes;
@@ -3704,7 +3758,7 @@ fn pumpConsoleOutput(app: *const App, conn_id: u32, stats: *ServiceStats, key: [
         stats.channel_output_failures +%= 1;
         setLastProtocolError(stats, "console-output-overrun");
         noteCloseReason(stats, "console-output-overrun");
-        _ = app.sys.programKill(channel.shell_instance);
+        _ = app.sys.programHandleKill(&channel.shell_handle);
         noteChannelExit(stats, 3);
         scheduleChannelClose(channel, 3);
         return true;
@@ -5340,98 +5394,46 @@ fn waitForEncryptedPacketPending(app: *const App, conn_id: u32, timeout_ticks: u
     return false;
 }
 
-fn remoteProgramDone(app: *const App, instance_id: u32) bool {
-    return remoteProgramExitCode(app, instance_id) != null;
+fn remoteProgramDone(app: *const App, process: *const r4os.abi.ProgramProcessHandle) bool {
+    return remoteProgramExitCode(app, process) != null;
 }
 
-const ProgramInventoryLookup = union(enum) {
-    found: r4os.abi.ProgramInstanceInfo,
-    missing,
-    unavailable,
-};
-
-const inventory_restart_limit: u32 = 16;
-const inventory_would_block_retry_limit: u32 = 64;
-
-fn remoteProgramExitCode(app: *const App, instance_id: u32) ?i32 {
-    if (instance_id == 0) return 0;
-    switch (inventoryProgramById(app, instance_id)) {
-        .found => |info| {
-            if (info.state == @intFromEnum(r4os.abi.ProgramInstanceState.done)) return info.exit_code;
-            return null;
-        },
-        .unavailable => return null,
-        .missing => {},
-    }
-    const reaped_exit = app.sys.programReapInstance(instance_id);
-    if (reaped_exit != -1 and reaped_exit != -2) return reaped_exit;
-    return null;
+fn remoteProgramExitCode(app: *const App, process: *const r4os.abi.ProgramProcessHandle) ?i32 {
+    if (process.instance_id == 0) return 0;
+    // Query the exact child. A global inventory snapshot cannot be an
+    // authoritative answer for a specific handle under registry churn.
+    var info: r4os.abi.ProgramInstanceInfo = .{};
+    if (app.sys.programHandleStatus(process, &info) == r4os.abi.program_handle_ok and
+        info.state == @intFromEnum(r4os.abi.ProgramInstanceState.done)) return info.exit_code;
+    var completion: r4os.abi.ProgramProcessCompletion = .{};
+    if (app.sys.programHandleWait(process, 0, &completion) != r4os.abi.program_handle_ok) return null;
+    return completion.exit_code;
 }
 
-fn inventoryProgramById(app: *const App, instance_id: u32) ProgramInventoryLookup {
-    var attempt: u32 = 0;
-    restart: while (attempt < inventory_restart_limit) : (attempt += 1) {
-        var cursor: r4os.abi.ProgramInventoryCursor = .{};
-        var summary: r4os.abi.ProgramInventorySummary = .{};
-        if (!beginProgramInventory(app, &cursor, &summary)) return .unavailable;
-        while (true) {
-            var entries: [@as(usize, r4os.abi.program_inventory_page_max)]r4os.abi.ProgramInstanceSnapshot = undefined;
-            var page: r4os.abi.ProgramInventoryPageInfo = .{};
-            if (!readProgramInventoryPage(app, &cursor, entries[0..], &page)) return .unavailable;
-            if (page.status == r4os.abi.program_inventory_status_restart) continue :restart;
-            if (page.returned > entries.len or page.snapshot_generation != cursor.snapshot_generation) return .unavailable;
-            for (entries[0..@intCast(page.returned)]) |entry| {
-                if (entry.info.id == instance_id) return .{ .found = entry.info };
-            }
-            if (page.status == r4os.abi.program_inventory_status_complete) return .missing;
-            if (page.status != r4os.abi.program_inventory_status_more or page.returned == 0) return .unavailable;
+fn retireRemoteProgram(app: *const App, process: *const r4os.abi.ProgramProcessHandle) void {
+    if (process.instance_id == 0) return;
+    var completion: r4os.abi.ProgramProcessCompletion = .{};
+    var request_close = true;
+    while (true) {
+        switch (app.sys.programHandleReap(process, &completion)) {
+            r4os.abi.program_handle_ok, r4os.abi.program_handle_error_not_found, r4os.abi.program_handle_error_stale => return,
+            r4os.abi.program_handle_error_would_block => {},
+            else => {
+                // Preserve the exact child and its owner while completion
+                // cannot be confirmed; returning would orphan that cleanup.
+                app.sys.sleepTicks(1);
+                continue;
+            },
         }
-    }
-    return .unavailable;
-}
-
-fn beginProgramInventory(
-    app: *const App,
-    cursor: *r4os.abi.ProgramInventoryCursor,
-    summary: *r4os.abi.ProgramInventorySummary,
-) bool {
-    var retry: u32 = 0;
-    while (retry <= inventory_would_block_retry_limit) : (retry += 1) {
-        cursor.* = .{};
-        summary.* = .{};
-        const status = app.sys.programInventoryBegin(cursor, summary);
-        if (status == r4os.abi.program_handle_ok) return true;
-        if (status != r4os.abi.program_handle_error_would_block or retry == inventory_would_block_retry_limit)
-            return false;
+        if (request_close) {
+            switch (app.sys.programHandleKill(process)) {
+                r4os.abi.program_handle_ok, r4os.abi.program_handle_error_not_running,
+                r4os.abi.program_handle_error_not_found, r4os.abi.program_handle_error_stale => request_close = false,
+                else => {},
+            }
+        }
         app.sys.sleepTicks(1);
     }
-    return false;
-}
-
-fn readProgramInventoryPage(
-    app: *const App,
-    cursor: *r4os.abi.ProgramInventoryCursor,
-    entries: []r4os.abi.ProgramInstanceSnapshot,
-    page: *r4os.abi.ProgramInventoryPageInfo,
-) bool {
-    var retry: u32 = 0;
-    while (retry <= inventory_would_block_retry_limit) : (retry += 1) {
-        const cursor_before = cursor.*;
-        page.* = .{};
-        const status = app.sys.programInventoryPrograms(cursor, entries, page);
-        if (status == r4os.abi.program_handle_ok) return true;
-        cursor.* = cursor_before;
-        page.* = .{};
-        if (status != r4os.abi.program_handle_error_would_block or retry == inventory_would_block_retry_limit)
-            return false;
-        app.sys.sleepTicks(1);
-    }
-    return false;
-}
-
-fn reapProgramInstance(app: *const App, instance_id: u32) void {
-    if (instance_id == 0) return;
-    _ = app.sys.programReapInstance(instance_id);
 }
 
 fn sshExitStatus(exit_code: i32) u32 {
@@ -5552,7 +5554,7 @@ fn scheduleProgramExit(app: *const App, stats: *ServiceStats, channel: *ChannelS
     // output queue before that queue may be drained and EOF sent. Failed or
     // racing snapshots leave the channel open for the normal bounded pump.
     if (!channel.console_snapshot_valid or
-        channel.last_console_revision != app.sys.consoleRevision(channel.shell_instance)) return;
+        channel.last_console_revision != app.sys.consoleRevision(channel.shell_handle.instance_id)) return;
     channel.last_exit_code = exit_code;
     noteChannelExit(stats, exit_code);
     noteCloseReason(stats, "remote-exit");
@@ -5580,8 +5582,9 @@ test "program exit drains the last console revision before channel close" {
             state.* = .{ .output_len = @intCast(output.len), .stdout_bytes = stream_override orelse @intCast(output.len), .output_dropped_bytes = dropped };
             return 0;
         }
-        fn kill(id: u32) callconv(.c) i32 {
-            killed = id;
+        fn kill(process: *const r4os.abi.ProgramProcessHandle) callconv(.c) i32 {
+            if (process.generation != process.instance_id) return r4os.abi.program_handle_error_stale;
+            killed = process.instance_id;
             return 0;
         }
         fn readOutput(_: u32, bytes: [*]u8, capacity: u32) callconv(.c) i32 {
@@ -5598,7 +5601,7 @@ test "program exit drains the last console revision before channel close" {
         }
     };
     const raw: r4os.abi.R4XStartContext = .{};
-    const sys_table: r4os.abi.R4XStartR4Sys = .{ .ticks = @intFromPtr(&Peer.ticks), .program_kill = @intFromPtr(&Peer.kill) };
+    const sys_table: r4os.abi.R4XStartR4Sys = .{ .ticks = @intFromPtr(&Peer.ticks), .program_handle_kill = @intFromPtr(&Peer.kill) };
     const desk_table: r4os.abi.R4XStartR4Desk = .{
         .console_revision = @intFromPtr(&Peer.readRevision),
         .console_state = @intFromPtr(&Peer.readState),
@@ -5610,7 +5613,7 @@ test "program exit drains the last console revision before channel close" {
     defer std.testing.allocator.destroy(buffers);
     buffers.* = .{};
     var stats: ServiceStats = .{};
-    var channel: ChannelState = .{ .shell_started = true, .exec_started = true, .shell_instance = 7 };
+    var channel: ChannelState = .{ .shell_started = true, .exec_started = true, .shell_handle = .{ .instance_id = 7, .generation = 7 } };
     var rng: SessionRng = undefined;
     var seq: u32 = 0;
 
@@ -5641,7 +5644,7 @@ test "program exit drains the last console revision before channel close" {
 
     // Even an empty command needs a successful snapshot; revision zero alone
     // is not evidence that its output was read.
-    channel = .{ .shell_started = true, .exec_started = true, .shell_instance = 8 };
+    channel = .{ .shell_started = true, .exec_started = true, .shell_handle = .{ .instance_id = 8, .generation = 8 } };
     buffers.channel_output.clear();
     Peer.output = "";
     Peer.revision = 0;
@@ -5653,7 +5656,7 @@ test "program exit drains the last console revision before channel close" {
 
     // A retained tail cannot replace unread bytes, even if the producer has
     // already exited successfully. Report loss and retire this exact child.
-    channel = .{ .shell_started = true, .exec_started = true, .shell_instance = 9 };
+    channel = .{ .shell_started = true, .exec_started = true, .shell_handle = .{ .instance_id = 9, .generation = 9 } };
     buffers.channel_output.clear();
     Peer.output = "tail";
     Peer.stream_override = 100;
@@ -5666,7 +5669,7 @@ test "program exit drains the last console revision before channel close" {
     try std.testing.expect(std.mem.indexOf(u8, buffers.channel_output.peek(), "lost 96 bytes") != null);
 
     // Dropping a previously delivered prefix is normal scrolling.
-    channel = .{ .shell_started = true, .exec_started = true, .shell_instance = 10, .last_console_stream_bytes = 96, .last_output_dropped_bytes = 92, .last_output_len = 4 };
+    channel = .{ .shell_started = true, .exec_started = true, .shell_handle = .{ .instance_id = 10, .generation = 10 }, .last_console_stream_bytes = 96, .last_output_dropped_bytes = 92, .last_output_len = 4 };
     buffers.channel_output.clear();
     try std.testing.expect(pumpConsoleOutput(&app, 0, &stats, "", buffers, &rng, &seq, &channel));
     try std.testing.expect(!channel.close_after_output);
@@ -6532,30 +6535,34 @@ const Writer = struct {
     }
 
     fn byte(self: *Writer, value: u8) bool {
-        if (self.pos >= self.buf.len) return false;
-        self.buf[self.pos] = value;
-        self.pos += 1;
+        var cursor = r4os.binary_cursor.Writer.init(self.buf) catch return false;
+        cursor.position = self.pos;
+        cursor.writeInt(u8, value, .big) catch return false;
+        self.pos = cursor.position;
         return true;
     }
 
     fn bytes(self: *Writer, value: []const u8) bool {
-        if (self.pos + value.len > self.buf.len) return false;
-        if (value.len != 0) @memcpy(self.buf[self.pos .. self.pos + value.len], value);
-        self.pos += value.len;
+        var cursor = r4os.binary_cursor.Writer.init(self.buf) catch return false;
+        cursor.position = self.pos;
+        cursor.put(value) catch return false;
+        self.pos = cursor.position;
         return true;
     }
 
     fn beU32(self: *Writer, value: u32) bool {
-        if (self.pos + 4 > self.buf.len) return false;
-        writeBeU32(self.buf[self.pos..], value);
-        self.pos += 4;
+        var cursor = r4os.binary_cursor.Writer.init(self.buf) catch return false;
+        cursor.position = self.pos;
+        cursor.writeInt(u32, value, .big) catch return false;
+        self.pos = cursor.position;
         return true;
     }
 
     fn beU64(self: *Writer, value: u64) bool {
-        if (self.pos + 8 > self.buf.len) return false;
-        writeBeU64(self.buf[self.pos..], value);
-        self.pos += 8;
+        var cursor = r4os.binary_cursor.Writer.init(self.buf) catch return false;
+        cursor.position = self.pos;
+        cursor.writeInt(u64, value, .big) catch return false;
+        self.pos = cursor.position;
         return true;
     }
 
@@ -6571,40 +6578,28 @@ const Writer = struct {
 };
 
 const Reader = struct {
-    data: []const u8,
-    pos: usize = 0,
+    cursor: r4os.binary_cursor.Reader,
 
     fn init(data: []const u8) Reader {
-        return .{ .data = data };
+        return .{ .cursor = r4os.binary_cursor.Reader.init(data) catch unreachable };
     }
 
     fn readByte(self: *Reader) ?u8 {
-        if (self.pos >= self.data.len) return null;
-        const value = self.data[self.pos];
-        self.pos += 1;
-        return value;
+        return self.cursor.readInt(u8, .big) catch null;
     }
 
     fn readU32(self: *Reader) ?u32 {
-        if (self.pos + 4 > self.data.len) return null;
-        const value = readBeU32(self.data[self.pos..]);
-        self.pos += 4;
-        return value;
+        return self.cursor.readInt(u32, .big) catch null;
     }
 
     fn readU64(self: *Reader) ?u64 {
-        if (self.pos + 8 > self.data.len) return null;
-        const value = readBeU64(self.data[self.pos..]);
-        self.pos += 8;
-        return value;
+        return self.cursor.readInt(u64, .big) catch null;
     }
 
     fn readString(self: *Reader) ?[]const u8 {
         const len = self.readU32() orelse return null;
-        if (len > self.data.len - self.pos) return null;
-        const start = self.pos;
-        self.pos += @intCast(len);
-        return self.data[start..self.pos];
+        const span = self.cursor.take(len) catch return null;
+        return span.bytes() catch null;
     }
 };
 
@@ -6660,33 +6655,11 @@ fn writeLeU32(out: []u8, value: u32) void {
     out[3] = @intCast((value >> 24) & 0xff);
 }
 
-fn writeBeU64(out: []u8, value: u64) void {
-    out[0] = @intCast((value >> 56) & 0xff);
-    out[1] = @intCast((value >> 48) & 0xff);
-    out[2] = @intCast((value >> 40) & 0xff);
-    out[3] = @intCast((value >> 32) & 0xff);
-    out[4] = @intCast((value >> 24) & 0xff);
-    out[5] = @intCast((value >> 16) & 0xff);
-    out[6] = @intCast((value >> 8) & 0xff);
-    out[7] = @intCast(value & 0xff);
-}
-
 fn readBeU32(data: []const u8) u32 {
     return (@as(u32, data[0]) << 24) |
         (@as(u32, data[1]) << 16) |
         (@as(u32, data[2]) << 8) |
         @as(u32, data[3]);
-}
-
-fn readBeU64(data: []const u8) u64 {
-    return (@as(u64, data[0]) << 56) |
-        (@as(u64, data[1]) << 48) |
-        (@as(u64, data[2]) << 40) |
-        (@as(u64, data[3]) << 32) |
-        (@as(u64, data[4]) << 24) |
-        (@as(u64, data[5]) << 16) |
-        (@as(u64, data[6]) << 8) |
-        @as(u64, data[7]);
 }
 
 fn runPingClient(app: *const App) i32 {
@@ -7000,15 +6973,20 @@ fn fail(app: *const App, label: []const u8) i32 {
     return 1;
 }
 
-fn hasArg(args: [*:0]const u8, wanted: []const u8) bool {
-    var offset: usize = 0;
-    while (offset < 256 and args[offset] != 0) {
-        while (offset < 256 and (args[offset] == ' ' or args[offset] == '\t')) : (offset += 1) {}
-        const start = offset;
-        while (offset < 256 and args[offset] != 0 and args[offset] != ' ' and args[offset] != '\t') : (offset += 1) {}
-        if (equalsIgnoreCase(args[start..offset], wanted)) return true;
+const ServiceAction = enum(u8) { run, status, ping, selftest };
+
+fn serviceAction(app: *const r4os.App2) r4os.arguments.Error!ServiceAction {
+    const raw = app.args();
+    var failure: r4os.arguments.Failure = .{};
+    var cursor = try app.argCursor(.{ .quotes = @intFromEnum(r4os.arguments.Quotes.none), .max_bytes = 256 }, &failure);
+    var action: ServiceAction = .run;
+    while (try cursor.next()) |token| {
+        const arg = try token.bytes(raw);
+        if (std.ascii.eqlIgnoreCase(arg, selftest_arg)) action = .selftest;
+        if (@intFromEnum(action) < @intFromEnum(ServiceAction.ping) and std.ascii.eqlIgnoreCase(arg, ping_arg)) action = .ping;
+        if (action == .run and std.ascii.eqlIgnoreCase(arg, status_arg)) action = .status;
     }
-    return false;
+    return action;
 }
 
 fn copyFixedZ(dest: []u8, src: []const u8) void {

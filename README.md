@@ -4,7 +4,7 @@
 
 ## Package
 
-- Version: `0.1.17`
+- Version: see `module.R4MF`
 - Image target: `/R4OS/SERVICES/SSHD.R4X`
 - Image scope: `full`
 - Canonical project manifest: `module.R4MF`
@@ -16,6 +16,12 @@ When a console program exits, SSHD queues its final stable console revision
 before sending exit status, EOF and close. Program completion between the
 output and status queries can no longer discard the final lines. Backpressure
 and unstable snapshots retain the channel for the next normal pump.
+
+SSHD runs as a Start2 service. The session worker keeps the child's process
+generation through status, kill and reap. Interactive Terminal input and
+output still use its Terminal console; it does not inherit explicit pipes.
+The listener is registered again after a confirmed missing-listener response
+from TCPSVC. Existing sessions and worker memory stay owned until join.
 
 ## Build
 
