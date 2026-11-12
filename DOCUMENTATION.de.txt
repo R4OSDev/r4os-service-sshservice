@@ -307,3 +307,18 @@ als console-output-overrun und beendet den genauen Aufruf mit Status 3.
 Der Kindprozess wird beendet und ueber den bestehenden Abbaupfad geerntet.
 Normales Scrollen bereits gesendeter Bytes sowie explizites CLS bleiben
 zulaessig; ein unvollstaendiger JSON-Stream liefert keinen Erfolgsstatus.
+
+
+Begrenzte Servicefortsetzungen ab0.90.80 / SSHD0.1.21
+---------------------------------------------------
+Jeder eigens gejointe Sitzungsworker fordert vor seiner Arbeit die bestehende
+Preferred-Klasse mit unveraenderter Standard-CPU-Menge an. Nach einem echten
+Yield werden angewendete Revision, Klasse und fehlendes Pending geprueft.
+Ein Fehler beendet den bisherigen Start-/Verbindungsabbaupfad definiert.
+Die Klasse verwendet nur das vorhandene begrenzte ShortCompletion-Budget
+von4Ticks/4Dispatches je Aktivierung; sie erzeugt keine Dauerprioritaet.
+TCP-Dispatcher und SSH-Sitzungsfortsetzung liegen gemeinsam auf dem
+fristgebundenen Netzwerkpfad und benoetigen beide diese Einordnung.
+BSP-/Workerzulassung, Protokollfristen, PCM-Budgets, Wireformate und echte
+Stop-/Joinquittungen bleiben erhalten. Diagnose-OpCodes und Messzaehler
+der lokalen Ursachenanalyse gehoeren nicht zur Serviceimplementierung.

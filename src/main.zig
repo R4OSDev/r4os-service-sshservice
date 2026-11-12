@@ -1217,9 +1217,42 @@ fn pollClient(app: *const App, stats: *ServiceStats, config: *const Config, host
     return true;
 }
 
+fn configureSessionScheduling(app: *const App) i32 {
+    // Each session owns finite-deadline TCP work. Its short continuations
+    // need the existing bounded completion class as well as the dispatcher;
+    // CPU admission, crypto work and protocol deadlines retain their limits.
+    var worker: r4os.abi.ProgramJoinHandle = .{};
+    const current_result = app.sys.threadCurrentHandle(&worker);
+    if (current_result != r4os.abi.thread_ok) return current_result;
+    const request = r4os.abi.ThreadPlacementRequest{
+        .flags = r4os.abi.thread_placement_flag_default_cpus,
+        .work_class = r4os.abi.thread_placement_class_preferred,
+    };
+    const set_result = app.sys.threadPlacementSet(&worker, &request, &.{});
+    if (set_result != r4os.abi.thread_ok) return set_result;
+    // The current thread adopts placement only after its context is saved.
+    app.sys.taskYield();
+    var applied: r4os.abi.ThreadPlacementInfo = .{};
+    const get_result = app.sys.threadPlacementGet(&worker, &applied, &.{});
+    if (get_result != r4os.abi.thread_ok) return get_result;
+    if (applied.work_class != r4os.abi.thread_placement_class_preferred or
+        applied.request_revision != applied.applied_revision or
+        (applied.flags & r4os.abi.thread_placement_flag_pending) != 0)
+        return r4os.abi.thread_error_busy;
+    return r4os.abi.thread_ok;
+}
+
 fn sshSessionWorkerMain(arg: u64) callconv(.c) i32 {
     const slot: *SessionWorkerSlot = @ptrFromInt(arg);
     const app = slot.app;
+    const scheduling_result = configureSessionScheduling(app);
+    if (scheduling_result != r4os.abi.thread_ok) {
+        setLastProtocolError(&slot.stats, "worker-scheduling");
+        slot.exit_code = scheduling_result;
+        slot.finished_tick = app.sys.ticks();
+        closeTcpSession(app, slot.conn_id);
+        return scheduling_result;
+    }
     const buffers = slot.buffers orelse {
         slot.stats.tcp_errors +%= 1;
         setLastProtocolError(&slot.stats, "scratch-missing");
