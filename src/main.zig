@@ -5633,9 +5633,9 @@ test "program exit drains the last console revision before channel close" {
             return 123;
         }
     };
-    const raw: r4os.abi.R4XStartContext = .{};
-    const sys_table: r4os.abi.R4XStartR4Sys = .{ .ticks = @intFromPtr(&Peer.ticks), .program_handle_kill = @intFromPtr(&Peer.kill) };
-    const desk_table: r4os.abi.R4XStartR4Desk = .{
+    const raw: @import("r4os").platform2.abi.R4XStartContext2 = .{};
+    const sys_table: @import("r4os").platform2.abi.R4XStartR4Sys2 = .{ .ticks = @intFromPtr(&Peer.ticks), .program_handle_kill = @intFromPtr(&Peer.kill) };
+    const desk_table: @import("r4os").platform2.abi.R4XStartR4Desk2 = .{
         .console_revision = @intFromPtr(&Peer.readRevision),
         .console_state = @intFromPtr(&Peer.readState),
         .console_output = @intFromPtr(&Peer.readOutput),
